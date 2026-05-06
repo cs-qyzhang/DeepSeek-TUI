@@ -51,6 +51,8 @@ struct InjectPlan {
     total_bytes: usize,
     /// Number of files skipped due to budget.
     skipped_count: usize,
+    /// Workspace-relative paths of included files (sorted).
+    files: Vec<String>,
 }
 
 /// Walk the workspace and build the injection message text.
@@ -147,11 +149,14 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         skipped_note
     ));
 
+    let file_paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+
     Some(InjectPlan {
         message: msg,
         file_count: files.len(),
         total_bytes,
         skipped_count,
+        files: file_paths,
     })
 }
 
@@ -200,13 +205,15 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
     let kb = plan.total_bytes / 1024;
 
     let skipped_line = if plan.skipped_count > 0 {
-        format!(
-            "\nFiles skipped (budget): {}",
-            plan.skipped_count
-        )
+        format!("\nFiles skipped (budget): {}", plan.skipped_count)
     } else {
         String::new()
     };
+
+    let mut file_list = String::new();
+    for f in &plan.files {
+        file_list.push_str(&format!("  {f}\n"));
+    }
 
     CommandResult::message(format!(
         "Full Codes Token Estimate\n\
@@ -214,13 +221,17 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
          Files: {}\n\
          Content size: ~{} KB\n\
          Message chars: {}\n\
-         Estimated tokens: ~{}  (~4 chars/token heuristic){}",
+         Estimated tokens: ~{}  (~4 chars/token heuristic){}\n\
+         \n\
+         Files that would be injected:\n\
+         {}",
         app.workspace.display(),
         plan.file_count,
         kb,
         char_count,
         token_estimate,
         skipped_line,
+        file_list,
     ))
 }
 
