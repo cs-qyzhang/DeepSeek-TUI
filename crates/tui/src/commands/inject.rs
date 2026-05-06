@@ -327,7 +327,11 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
 }
 
 /// Walk the workspace and inject every project file into the prompt.
-pub fn inject_full_codes(app: &mut App) -> CommandResult {
+///
+/// When `user_text` is present (e.g. from `/inject 总结项目内容`), it is
+/// appended after the injected code so the model receives both the full
+/// project context and the user's request in a single turn.
+pub fn inject_full_codes(app: &mut App, user_text: Option<String>) -> CommandResult {
     let Some(plan) = build_injection_message(&app.workspace) else {
         return CommandResult::message(
             "No project files found to inject. Check that the workspace contains \
@@ -344,6 +348,14 @@ pub fn inject_full_codes(app: &mut App) -> CommandResult {
         String::new()
     };
 
+    // Build the final message: injected code, optionally followed by the
+    // user's request text.
+    let final_msg = if let Some(text) = user_text.filter(|t| !t.trim().is_empty()) {
+        format!("{message}\n\n---\n\n**User request:** {text}", message = plan.message)
+    } else {
+        plan.message
+    };
+
     CommandResult::with_message_and_action(
         format!(
             "Injected {} files (~{} KB) into context{}",
@@ -351,7 +363,7 @@ pub fn inject_full_codes(app: &mut App) -> CommandResult {
             plan.total_bytes / 1024,
             skipped_note
         ),
-        AppAction::SendMessage(plan.message),
+        AppAction::SendMessage(final_msg),
     )
 }
 
@@ -497,7 +509,7 @@ mod tests {
     fn inject_empty_workspace_returns_message() {
         let tmpdir = TempDir::new().unwrap();
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(
@@ -514,7 +526,7 @@ mod tests {
         fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         assert!(result.message.is_some());
         let status = result.message.unwrap();
@@ -555,7 +567,7 @@ mod tests {
         fs::write(tmpdir.path().join("excluded/keep.py"), "print('nope')").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
@@ -609,7 +621,7 @@ mod tests {
         fs::write(tmpdir.path().join("small.rs"), "fn main() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
@@ -647,7 +659,7 @@ mod tests {
         fs::write(tmpdir.path().join("README.md"), "# readme").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
@@ -676,7 +688,7 @@ mod tests {
         fs::write(tmpdir.path().join("README.md"), "# root readme").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
@@ -705,7 +717,7 @@ mod tests {
         fs::write(tmpdir.path().join("b.py"), "print('b')").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
@@ -726,7 +738,7 @@ mod tests {
         fs::write(tmpdir.path().join("visible.rs"), "fn visible() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
@@ -747,7 +759,7 @@ mod tests {
         fs::write(tmpdir.path().join("real.rs"), "fn real() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
@@ -765,7 +777,7 @@ mod tests {
         fs::write(tmpdir.path().join("lib.rs"), "pub fn x() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app);
+        let result = inject_full_codes(&mut app, None);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {

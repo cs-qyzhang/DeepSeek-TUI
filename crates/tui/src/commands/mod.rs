@@ -484,7 +484,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "inject-full-codes",
         aliases: &["inject"],
-        usage: "/inject-full-codes",
+        usage: "/inject-full-codes [user text]",
         description_id: MessageId::CmdInjectDescription,
     },
     CommandInfo {
@@ -537,7 +537,7 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "sessions" | "resume" => session::sessions(app, arg),
         "load" => session::load(app, arg),
         "compact" => session::compact(app),
-        "inject-full-codes" | "inject" => inject::inject_full_codes(app),
+        "inject-full-codes" | "inject" => inject::inject_full_codes(app, arg.map(|s| s.to_string())),
         "full-codes-tokens" | "inject-tokens" | "fct" => inject::full_codes_tokens(app),
         "cycles" => cycle::list_cycles(app),
         "cycle" => cycle::show_cycle(app, arg),
