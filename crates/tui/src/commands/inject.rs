@@ -53,8 +53,18 @@ const MAX_TOTAL_BYTES: usize = 800_000;
 /// earlier lines are given higher priority and will be included first
 /// when the budget is tight.  When no `.agentsee` file exists, every file
 /// passes with equal (lowest) priority.
+/// A compiled include pattern with its original text for specificity
+/// comparison.
+struct IncludeRule {
+    pattern: Pattern,
+    /// Original pattern text (e.g. "docs/", "*.rs") used to determine
+    /// specificity: directory patterns (containing `/`) are more specific
+    /// than bare filename patterns.
+    original: String,
+}
+
 struct Agentsee {
-    includes: Vec<Pattern>,
+    includes: Vec<IncludeRule>,
     excludes: Vec<Pattern>,
 }
 
@@ -93,7 +103,10 @@ impl Agentsee {
             if negated {
                 excludes.push(pattern);
             } else {
-                includes.push(pattern);
+                includes.push(IncludeRule {
+                    pattern,
+                    original: pat_str.to_string(),
+                });
             }
         }
 
@@ -103,15 +116,28 @@ impl Agentsee {
     /// Returns the priority index (0 = highest) for a workspace-relative
     /// path, or `None` if it should be excluded.  When `.agentsee` is
     /// absent, every file passes with max priority.
+    ///
+    /// When a file matches multiple patterns, the most specific one wins
+    /// (longest glob pattern length).  This means `scoutattention/benchmarks`
+    /// takes priority over the broader `scoutattention/` catch-all, and
+    /// `docs/` takes priority over the bare `README.md` pattern.
     fn priority(&self, rel: &str) -> Option<usize> {
         // Exclude patterns take priority.
         if self.excludes.iter().any(|p| p.matches(rel)) {
             return None;
         }
-        // Return the index of the first matching include pattern.
+        // Find all matching patterns and pick the most specific one.
+        // Specificity: original patterns containing `/` (directory patterns)
+        // always beat bare filenames; among equals, longer original text wins.
         self.includes
             .iter()
-            .position(|p| p.matches(rel))
+            .enumerate()
+            .filter(|(_, r)| r.pattern.matches(rel))
+            .max_by_key(|(_, r)| {
+                let is_dir = r.original.contains('/') as usize;
+                (is_dir, r.original.len())
+            })
+            .map(|(i, _)| i)
     }
 }
 
@@ -633,6 +659,39 @@ mod tests {
                     "core/utils/ (higher priority) must come before core/ files"
                 );
                 assert!(!content.contains("README.md"));
+            }
+            other => panic!("expected SendMessage action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inject_agentsee_specificity_wins_over_bare_pattern() {
+        // A bare filename pattern (e.g. "README.md") should NOT capture files
+        // that also match a directory pattern (e.g. "docs/"). The directory
+        // pattern is more specific.
+        let tmpdir = TempDir::new().unwrap();
+        fs::write(tmpdir.path().join(".agentsee"), "README.md\ndocs/\n").unwrap();
+        fs::create_dir_all(tmpdir.path().join("docs")).unwrap();
+        fs::write(tmpdir.path().join("docs/README.md"), "# sub readme").unwrap();
+        fs::write(tmpdir.path().join("README.md"), "# root readme").unwrap();
+
+        let mut app = create_test_app_in(&tmpdir);
+        let result = inject_full_codes(&mut app);
+
+        match result.action {
+            Some(AppAction::SendMessage(content)) => {
+                // Both files should be included
+                assert!(content.contains("### `README.md`"));
+                assert!(content.contains("### `docs/README.md`"));
+                // docs/README.md should be sorted into the docs/ pattern (index 1),
+                // not the bare README.md pattern (index 0). So root README.md
+                // (priority 0) comes before docs/ (priority 1).
+                let root_pos = content.find("### `README.md`").unwrap();
+                let docs_pos = content.find("### `docs/README.md`").unwrap();
+                assert!(
+                    root_pos < docs_pos,
+                    "root README.md (priority 0) should come before docs/README.md (priority 1)"
+                );
             }
             other => panic!("expected SendMessage action, got: {other:?}"),
         }
