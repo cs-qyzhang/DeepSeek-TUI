@@ -1,7 +1,7 @@
 //! Full-project code injection command: `/inject-full-codes`
 //!
 //! Walks the workspace directory using the `ignore` crate (respecting
-//! `.gitignore`, `.ignore`, `.deepseekignore`) and collects all source
+//! `.gitignore`, `.ignore`, `.agentignore`, `.deepseekignore`) and collects all source
 //! code and documentation files. Each file's full content is read and
 //! formatted as a Markdown code fence, then injected into the prompt as
 //! a user message. Designed for small-to-medium projects leveraging
@@ -63,7 +63,8 @@ pub fn inject_full_codes(app: &mut App) -> CommandResult {
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true);
-    // Also honor the project-specific `.deepseekignore` if present.
+    // Also honor project-specific ignore files if present.
+    let _ = builder.add_custom_ignore_filename(".agentignore");
     let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
     for entry in builder.build().flatten() {
@@ -278,6 +279,37 @@ mod tests {
                 assert!(content.contains("```rust"));
                 assert!(content.contains("```toml"));
                 assert!(content.contains("```markdown"));
+            }
+            other => panic!("expected SendMessage action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inject_respects_agentignore() {
+        let tmpdir = TempDir::new().unwrap();
+        fs::write(tmpdir.path().join(".agentignore"), "excluded/\nsecret.py\n").unwrap();
+        fs::create_dir(tmpdir.path().join("excluded")).unwrap();
+        fs::write(tmpdir.path().join("excluded/hidden.rs"), "fn hidden() {}").unwrap();
+        fs::write(tmpdir.path().join("secret.py"), "print('secret')").unwrap();
+        fs::write(tmpdir.path().join("visible.py"), "print('visible')").unwrap();
+
+        let mut app = create_test_app_in(&tmpdir);
+        let result = inject_full_codes(&mut app);
+
+        match result.action {
+            Some(AppAction::SendMessage(content)) => {
+                assert!(
+                    content.contains("visible.py"),
+                    "visible file should be included; content: {content}"
+                );
+                assert!(
+                    !content.contains("secret.py"),
+                    ".agentignore-listed file should be excluded; content: {content}"
+                );
+                assert!(
+                    !content.contains("hidden.rs"),
+                    ".agentignore-listed directory should be excluded; content: {content}"
+                );
             }
             other => panic!("expected SendMessage action, got: {other:?}"),
         }

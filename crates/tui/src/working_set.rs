@@ -95,8 +95,10 @@ impl Workspace {
         let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut builder = WalkBuilder::new(&self.root);
         builder.hidden(true).follow_links(false).max_depth(Some(6));
-        // Honor `.deepseekignore` in addition to the defaults the `ignore` crate
-        // already respects (`.gitignore`, `.git/info/exclude`, `.ignore`).
+        // Honor project-specific ignore files in addition to the defaults the
+        // `ignore` crate already respects (`.gitignore`, `.git/info/exclude`,
+        // `.ignore`).
+        let _ = builder.add_custom_ignore_filename(".agentignore");
         let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
         for entry in builder.build().flatten() {
@@ -195,6 +197,7 @@ fn walk_for_completions(
         .hidden(true)
         .follow_links(false)
         .max_depth(Some(COMPLETIONS_WALK_DEPTH));
+    let _ = builder.add_custom_ignore_filename(".agentignore");
     let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
     for entry in builder.build().flatten() {
