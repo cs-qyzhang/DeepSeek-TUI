@@ -297,10 +297,10 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
          path and full contents.\n\
          \n\
          **Important:** these files are already fully available in your \
-         context. Do NOT call `read_file` on any of them — it wastes \
-         context and duplicates data you already have. Instead, reference \
-         the relevant sections by path and approximate line range when \
-         discussing them.\n\n",
+         context. Avoid unnecessary `read_file` calls — re-reading wastes \
+         context and duplicates data you already have. If you need to \
+         discuss a specific section, reference it by path and approximate \
+         line range from the content above.\n\n",
     );
     msg.push_str("---\n\n");
 
