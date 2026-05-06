@@ -298,9 +298,7 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
          \n\
          **Important:** these files are already fully available in your \
          context. Avoid unnecessary `read_file` calls — re-reading wastes \
-         context and duplicates data you already have. If you need to \
-         discuss a specific section, reference it by path and approximate \
-         line range from the content above.\n\n",
+         context and duplicates data you already have.\n\n",
     );
     msg.push_str("---\n\n");
 
