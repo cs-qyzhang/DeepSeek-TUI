@@ -136,9 +136,15 @@ fn gitignore_to_glob(pat: &str) -> String {
     // relative paths are already anchored.
     let pat = pat.strip_prefix('/').unwrap_or(pat);
 
-    // If the pattern doesn't start with `*` or `**`, prepend `**/` so it
-    // matches at any depth (gitignore default behaviour for non-anchored
-    // patterns).
+    // Patterns containing a path separator are directory-like: match the
+    // path and everything recursively under it (e.g. `foo/bar` →
+    // `**/foo/bar/**`).  This matches user intent in an include file:
+    // `scoutattention/benchmarks` means the whole submodule.
+    if pat.contains('/') {
+        return format!("**/{pat}/**");
+    }
+
+    // Bare filename / extension glob: match at any depth.
     if !pat.starts_with('*') {
         format!("**/{pat}")
     } else {
@@ -589,6 +595,44 @@ mod tests {
                 // skipped — however it sorts after big.rs alphabetically and
                 // budget may or may not allow it. The key invariant: high
                 // priority files come first.
+            }
+            other => panic!("expected SendMessage action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inject_agentsee_nested_dir_priority() {
+        // Patterns with `/` but no trailing slash should match everything
+        // recursively under that path.
+        let tmpdir = TempDir::new().unwrap();
+        fs::write(
+            tmpdir.path().join(".agentsee"),
+            "core/utils/\ncore/\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmpdir.path().join("core/utils")).unwrap();
+        fs::write(
+            tmpdir.path().join("core/utils/helpers.py"),
+            "def help(): pass",
+        )
+        .unwrap();
+        fs::write(tmpdir.path().join("core/lib.rs"), "pub mod utils;").unwrap();
+        // This file should NOT match any pattern
+        fs::write(tmpdir.path().join("README.md"), "# readme").unwrap();
+
+        let mut app = create_test_app_in(&tmpdir);
+        let result = inject_full_codes(&mut app);
+
+        match result.action {
+            Some(AppAction::SendMessage(content)) => {
+                // core/utils/ has higher priority → utils/helpers.py first
+                let utils_pos = content.find("helpers.py").unwrap();
+                let lib_pos = content.find("lib.rs").unwrap();
+                assert!(
+                    utils_pos < lib_pos,
+                    "core/utils/ (higher priority) must come before core/ files"
+                );
+                assert!(!content.contains("README.md"));
             }
             other => panic!("expected SendMessage action, got: {other:?}"),
         }
