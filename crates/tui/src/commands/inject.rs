@@ -41,40 +41,45 @@ const PROJECT_EXTENSIONS: &[&str] = &[
 /// the system prompt, conversation history, and model response.
 const MAX_TOTAL_BYTES: usize = 800_000;
 
-/// Walk the workspace and inject every project file into the prompt.
-pub fn inject_full_codes(app: &mut App) -> CommandResult {
-    let workspace = app.workspace.clone();
+/// Result of collecting project files for injection.
+struct InjectPlan {
+    /// The formatted injection message text.
+    message: String,
+    /// Number of files included.
+    file_count: usize,
+    /// Total bytes of file contents (not including markdown framing).
+    total_bytes: usize,
+    /// Number of files skipped due to budget.
+    skipped_count: usize,
+}
 
+/// Walk the workspace and build the injection message text.
+/// Returns `None` when no project files are found.
+fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
     if !workspace.is_dir() {
-        return CommandResult::error(format!(
-            "Workspace is not a directory: {}",
-            workspace.display()
-        ));
+        return None;
     }
 
     let mut files: Vec<(String, String)> = Vec::new(); // (relative path, content)
     let mut total_bytes: usize = 0;
     let mut skipped_count: usize = 0;
 
-    let mut builder = WalkBuilder::new(&workspace);
+    let mut builder = WalkBuilder::new(workspace);
     builder
-        .hidden(true) // visit hidden files (for .env.example etc) but not .git
+        .hidden(true)
         .follow_links(false)
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true);
-    // Also honor project-specific ignore files if present.
     let _ = builder.add_custom_ignore_filename(".agentignore");
     let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
     for entry in builder.build().flatten() {
-        // Only regular files, no symlinks or special files.
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let path = entry.path();
 
-        // Must have a recognized extension.
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
         };
@@ -83,23 +88,19 @@ pub fn inject_full_codes(app: &mut App) -> CommandResult {
             continue;
         }
 
-        // Read file contents. Skip binary / unreadable files.
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        // Skip empty files — no signal.
         if content.trim().is_empty() {
             continue;
         }
 
-        // Check budget. If this file would push us over, skip it but keep
-        // trying smaller files in case the walk yields them later.
         if total_bytes + content.len() > MAX_TOTAL_BYTES {
             skipped_count += 1;
             continue;
         }
 
-        let rel = path.strip_prefix(&workspace).unwrap_or(path);
+        let rel = path.strip_prefix(workspace).unwrap_or(path);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
 
         total_bytes += content.len();
@@ -107,30 +108,24 @@ pub fn inject_full_codes(app: &mut App) -> CommandResult {
     }
 
     if files.is_empty() {
-        return CommandResult::message(
-            "No project files found to inject. Check that the workspace contains \
-             source or documentation files with recognized extensions.",
-        );
+        return None;
     }
 
-    // Sort by path for deterministic output (helps with prefix caching).
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Build the injection message.
     let mut msg = String::with_capacity(total_bytes + files.len() * 64);
     msg.push_str("## Full Project Code Injection\n\n");
-    msg.push_str(&format!(
-        "Workspace: {}\n",
-        workspace.display()
-    ));
+    msg.push_str(&format!("Workspace: {}\n", workspace.display()));
     msg.push_str(&format!(
         "Files included: {} (~{} KB total)\n\n",
         files.len(),
         total_bytes / 1024
     ));
-    msg.push_str("The following is the complete source code and documentation \
-                   for this project. Each file is shown with its workspace-relative \
-                   path and full contents.\n\n");
+    msg.push_str(
+        "The following is the complete source code and documentation \
+         for this project. Each file is shown with its workspace-relative \
+         path and full contents.\n\n",
+    );
     msg.push_str("---\n\n");
 
     for (path, content) in &files {
@@ -139,10 +134,7 @@ pub fn inject_full_codes(app: &mut App) -> CommandResult {
     }
 
     let skipped_note = if skipped_count > 0 {
-        format!(
-            " ({} file(s) skipped due to size budget)",
-            skipped_count
-        )
+        format!(" ({} file(s) skipped due to size budget)", skipped_count)
     } else {
         String::new()
     };
@@ -155,15 +147,81 @@ pub fn inject_full_codes(app: &mut App) -> CommandResult {
         skipped_note
     ));
 
+    Some(InjectPlan {
+        message: msg,
+        file_count: files.len(),
+        total_bytes,
+        skipped_count,
+    })
+}
+
+/// Walk the workspace and inject every project file into the prompt.
+pub fn inject_full_codes(app: &mut App) -> CommandResult {
+    let Some(plan) = build_injection_message(&app.workspace) else {
+        return CommandResult::message(
+            "No project files found to inject. Check that the workspace contains \
+             source or documentation files with recognized extensions.",
+        );
+    };
+
+    let skipped_note = if plan.skipped_count > 0 {
+        format!(
+            " ({} file(s) skipped due to size budget)",
+            plan.skipped_count
+        )
+    } else {
+        String::new()
+    };
+
     CommandResult::with_message_and_action(
         format!(
             "Injected {} files (~{} KB) into context{}",
-            files.len(),
-            total_bytes / 1024,
+            plan.file_count,
+            plan.total_bytes / 1024,
             skipped_note
         ),
-        AppAction::SendMessage(msg),
+        AppAction::SendMessage(plan.message),
     )
+}
+
+/// Dry-run the injection and estimate how many tokens the full message
+/// would consume. Does NOT send any message or modify the conversation.
+pub fn full_codes_tokens(app: &App) -> CommandResult {
+    let Some(plan) = build_injection_message(&app.workspace) else {
+        return CommandResult::message(
+            "No project files found for estimation. Check that the workspace \
+             contains source or documentation files with recognized extensions.",
+        );
+    };
+
+    // Conservative token estimate: ~4 chars per token for English / code.
+    let char_count = plan.message.chars().count();
+    let token_estimate = char_count.div_ceil(4);
+    let kb = plan.total_bytes / 1024;
+
+    let skipped_line = if plan.skipped_count > 0 {
+        format!(
+            "\nFiles skipped (budget): {}",
+            plan.skipped_count
+        )
+    } else {
+        String::new()
+    };
+
+    CommandResult::message(format!(
+        "Full Codes Token Estimate\n\
+         Workspace: {}\n\
+         Files: {}\n\
+         Content size: ~{} KB\n\
+         Message chars: {}\n\
+         Estimated tokens: ~{}  (~4 chars/token heuristic){}",
+        app.workspace.display(),
+        plan.file_count,
+        kb,
+        char_count,
+        token_estimate,
+        skipped_line,
+    ))
 }
 
 /// Map a file extension (or path) to a markdown code-fence language tag.

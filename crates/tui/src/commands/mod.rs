@@ -487,6 +487,12 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/inject-full-codes",
         description_id: MessageId::CmdInjectDescription,
     },
+    CommandInfo {
+        name: "full-codes-tokens",
+        aliases: &["inject-tokens", "fct"],
+        usage: "/full-codes-tokens",
+        description_id: MessageId::CmdFullCodesTokensDescription,
+    },
 ];
 
 /// Execute a slash command
@@ -532,6 +538,7 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "load" => session::load(app, arg),
         "compact" => session::compact(app),
         "inject-full-codes" | "inject" => inject::inject_full_codes(app),
+        "full-codes-tokens" | "inject-tokens" | "fct" => inject::full_codes_tokens(app),
         "cycles" => cycle::list_cycles(app),
         "cycle" => cycle::show_cycle(app, arg),
         "recall" => cycle::recall_archive(app, arg),

@@ -235,6 +235,7 @@ pub enum MessageId {
     CmdGoalDescription,
     CmdInitDescription,
     CmdInjectDescription,
+    CmdFullCodesTokensDescription,
     CmdJobsDescription,
     CmdLinksDescription,
     CmdLoadDescription,
@@ -426,6 +427,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdHooksDescription,
     MessageId::CmdInitDescription,
     MessageId::CmdInjectDescription,
+    MessageId::CmdFullCodesTokensDescription,
     MessageId::CmdJobsDescription,
     MessageId::CmdLinksDescription,
     MessageId::CmdLoadDescription,
@@ -748,6 +750,9 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CmdInjectDescription => {
             "Inject full project source code and documentation into the prompt"
         }
+        MessageId::CmdFullCodesTokensDescription => {
+            "Dry-run injection and estimate token count (~4 chars/token heuristic)"
+        }
         MessageId::CmdLspDescription => "Toggle LSP diagnostics on or off",
         MessageId::CmdShareDescription => "Export current session as a shareable web URL",
         MessageId::CmdJobsDescription => "Inspect and control background shell jobs",
@@ -1038,6 +1043,9 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         MessageId::CmdInjectDescription => {
             "プロジェクトの全ソースコードとドキュメントをプロンプトに注入"
         }
+        MessageId::CmdFullCodesTokensDescription => {
+            "注入をドライランしトークン数を推定（~4文字/トークンのヒューリスティック）"
+        }
         MessageId::CmdLspDescription => "LSP 診断のオン・オフを切り替え",
         MessageId::CmdShareDescription => "現在のセッションを共有可能な Web URL としてエクスポート",
         MessageId::CmdJobsDescription => "バックグラウンドのシェルジョブを確認・制御",
@@ -1306,6 +1314,9 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::CmdInjectDescription => {
             "将项目全部源代码和文档注入到提示词中"
         }
+        MessageId::CmdFullCodesTokensDescription => {
+            "预演注入并估算 token 数（~4 字符/token 启发式）"
+        }
         MessageId::CmdLspDescription => "切换 LSP 诊断的开启或关闭",
         MessageId::CmdShareDescription => "将当前会话导出为可共享的 Web URL",
         MessageId::CmdJobsDescription => "查看并管理后台 shell 作业",
@@ -1565,6 +1576,9 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
         MessageId::CmdInitDescription => "Gerar AGENTS.md para o projeto",
         MessageId::CmdInjectDescription => {
             "Injetar todo o código fonte e documentação do projeto no prompt"
+        }
+        MessageId::CmdFullCodesTokensDescription => {
+            "Simular a injeção e estimar a contagem de tokens (~4 caracteres/token)"
         }
         MessageId::CmdLspDescription => "Alternar diagnóstico LSP ligado ou desligado",
         MessageId::CmdShareDescription => "Exportar a sessão atual como uma URL web compartilhável",
