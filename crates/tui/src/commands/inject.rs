@@ -49,8 +49,10 @@ const MAX_TOTAL_BYTES: usize = 800_000;
 ///
 /// Gitignore syntax, but inverted: patterns specify what to **include**,
 /// and lines starting with `!` specify what to **force-exclude** (taking
-/// priority over include patterns).  When no `.agentsee` file exists,
-/// every file passes the filter.
+/// priority over include patterns).  Pattern order matters: files matching
+/// earlier lines are given higher priority and will be included first
+/// when the budget is tight.  When no `.agentsee` file exists, every file
+/// passes with equal (lowest) priority.
 struct Agentsee {
     includes: Vec<Pattern>,
     excludes: Vec<Pattern>,
@@ -95,25 +97,21 @@ impl Agentsee {
             }
         }
 
-        if includes.is_empty() {
-            // No positive patterns → include nothing.
-            return Some(Self {
-                includes: Vec::new(),
-                excludes,
-            });
-        }
-
         Some(Self { includes, excludes })
     }
 
-    /// Returns `true` when the workspace-relative path should be included.
-    fn is_included(&self, rel: &str) -> bool {
+    /// Returns the priority index (0 = highest) for a workspace-relative
+    /// path, or `None` if it should be excluded.  When `.agentsee` is
+    /// absent, every file passes with max priority.
+    fn priority(&self, rel: &str) -> Option<usize> {
         // Exclude patterns take priority.
         if self.excludes.iter().any(|p| p.matches(rel)) {
-            return false;
+            return None;
         }
-        // Must match at least one include pattern.
-        self.includes.iter().any(|p| p.matches(rel))
+        // Return the index of the first matching include pattern.
+        self.includes
+            .iter()
+            .position(|p| p.matches(rel))
     }
 }
 
@@ -164,6 +162,10 @@ struct InjectPlan {
 
 /// Walk the workspace and build the injection message text.
 /// Returns `None` when no project files are found.
+///
+/// When a `.agentsee` file exists, files are collected in priority order:
+/// files matching earlier patterns are read first.  When budget is tight,
+/// later (less important) files are naturally skipped.
 fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
     if !workspace.is_dir() {
         return None;
@@ -171,9 +173,9 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
 
     let agentsee = Agentsee::load(workspace);
 
-    let mut files: Vec<(String, String)> = Vec::new(); // (relative path, content)
-    let mut total_bytes: usize = 0;
-    let mut skipped_count: usize = 0;
+    // Pass 1: collect candidate paths with their priority.
+    // (priority, rel_path, abs_path)
+    let mut candidates: Vec<(usize, String, std::path::PathBuf)> = Vec::new();
 
     let mut builder = WalkBuilder::new(workspace);
     builder
@@ -201,14 +203,36 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         let rel = path.strip_prefix(workspace).unwrap_or(path);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
 
-        // Apply `.agentsee` filter if present.
-        if let Some(ref see) = agentsee
-            && !see.is_included(&rel_str)
-        {
-            continue;
-        }
+        // Determine priority: lower = more important.
+        let priority = if let Some(ref see) = agentsee {
+            // If the file matches no include pattern, skip it.
+            // `None` means excluded (either by `!` or not matching any include).
+            let Some(p) = see.priority(&rel_str) else {
+                continue;
+            };
+            p
+        } else {
+            // No .agentsee → all files equal (lowest priority).
+            usize::MAX
+        };
 
-        let Ok(content) = std::fs::read_to_string(path) else {
+        candidates.push((priority, rel_str.to_string(), path.to_path_buf()));
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Sort by priority (lower first), then by path for deterministic output.
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    // Pass 2: read files in priority order, accumulating up to budget.
+    let mut files: Vec<(String, String)> = Vec::new(); // (relative path, content)
+    let mut total_bytes: usize = 0;
+    let mut skipped_count: usize = 0;
+
+    for (_priority, rel_str, abs_path) in &candidates {
+        let Ok(content) = std::fs::read_to_string(abs_path) else {
             continue;
         };
         if content.trim().is_empty() {
@@ -221,14 +245,8 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         }
 
         total_bytes += content.len();
-        files.push((rel_str.to_string(), content));
+        files.push((rel_str.clone(), content));
     }
-
-    if files.is_empty() {
-        return None;
-    }
-
-    files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut msg = String::with_capacity(total_bytes + files.len() * 64);
     msg.push_str("## Full Project Code Injection\n\n");
@@ -471,7 +489,7 @@ mod tests {
     #[test]
     fn inject_respects_agentsee() {
         let tmpdir = TempDir::new().unwrap();
-        // Only include .rs and .py files, exclude anything in excluded/
+        // *.rs first (higher priority), *.py second, !excluded/ excludes
         fs::write(
             tmpdir.path().join(".agentsee"),
             "*.rs\n*.py\n!excluded/\n",
@@ -514,6 +532,45 @@ mod tests {
                     !content.contains("README.md"),
                     "README.md should not be included (not in .agentsee); content: {content}"
                 );
+                // Priority order: *.rs files should appear before *.py files
+                let rs_pos = content.find("### `visible.rs`").unwrap();
+                let py_pos = content.find("### `secret.py`").unwrap();
+                assert!(
+                    rs_pos < py_pos,
+                    "*.rs (higher priority) must appear before *.py in output"
+                );
+            }
+            other => panic!("expected SendMessage action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inject_agentsee_budget_skips_low_priority_first() {
+        let tmpdir = TempDir::new().unwrap();
+        // High priority: *.toml; lower: *.rs
+        fs::write(tmpdir.path().join(".agentsee"), "*.toml\n*.rs\n").unwrap();
+        // Small high-priority file
+        fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
+        // Large low-priority file that won't fit with Cargo.toml in budget.
+        // Cargo.toml is ~28 bytes; make big.rs large enough so combined > MAX.
+        let big_content = "x".repeat(MAX_TOTAL_BYTES);
+        fs::write(tmpdir.path().join("big.rs"), &big_content).unwrap();
+        // Small low-priority file that fits after big.rs is skipped.
+        fs::write(tmpdir.path().join("small.rs"), "fn main() {}").unwrap();
+
+        let mut app = create_test_app_in(&tmpdir);
+        let result = inject_full_codes(&mut app);
+
+        match result.action {
+            Some(AppAction::SendMessage(content)) => {
+                // Cargo.toml (high priority) should be included
+                assert!(content.contains("Cargo.toml"));
+                // big.rs is lower priority; would exceed budget, skipped
+                assert!(!content.contains("big.rs"));
+                // small.rs is also lower priority but fits after big.rs was
+                // skipped — however it sorts after big.rs alphabetically and
+                // budget may or may not allow it. The key invariant: high
+                // priority files come first.
             }
             other => panic!("expected SendMessage action, got: {other:?}"),
         }
