@@ -294,7 +294,13 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
     msg.push_str(
         "The following is the complete source code and documentation \
          for this project. Each file is shown with its workspace-relative \
-         path and full contents.\n\n",
+         path and full contents.\n\
+         \n\
+         **Important:** these files are already fully available in your \
+         context. Do NOT call `read_file` on any of them — it wastes \
+         context and duplicates data you already have. Instead, reference \
+         the relevant sections by path and approximate line range when \
+         discussing them.\n\n",
     );
     msg.push_str("---\n\n");
 
