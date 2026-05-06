@@ -234,6 +234,7 @@ pub enum MessageId {
     CmdHooksDescription,
     CmdGoalDescription,
     CmdInitDescription,
+    CmdInjectDescription,
     CmdJobsDescription,
     CmdLinksDescription,
     CmdLoadDescription,
@@ -424,6 +425,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdHomeDescription,
     MessageId::CmdHooksDescription,
     MessageId::CmdInitDescription,
+    MessageId::CmdInjectDescription,
     MessageId::CmdJobsDescription,
     MessageId::CmdLinksDescription,
     MessageId::CmdLoadDescription,
@@ -743,6 +745,9 @@ fn english(id: MessageId) -> &'static str {
         MessageId::CmdHooksDescription => "List configured lifecycle hooks (read-only)",
         MessageId::CmdGoalDescription => "Set a session goal with optional token budget",
         MessageId::CmdInitDescription => "Generate AGENTS.md for project",
+        MessageId::CmdInjectDescription => {
+            "Inject full project source code and documentation into the prompt"
+        }
         MessageId::CmdLspDescription => "Toggle LSP diagnostics on or off",
         MessageId::CmdShareDescription => "Export current session as a shareable web URL",
         MessageId::CmdJobsDescription => "Inspect and control background shell jobs",
@@ -1030,6 +1035,9 @@ fn japanese(id: MessageId) -> Option<&'static str> {
         }
         MessageId::CmdGoalDescription => "トークンバジェット付きのセッション目標を設定",
         MessageId::CmdInitDescription => "プロジェクト用に AGENTS.md を生成",
+        MessageId::CmdInjectDescription => {
+            "プロジェクトの全ソースコードとドキュメントをプロンプトに注入"
+        }
         MessageId::CmdLspDescription => "LSP 診断のオン・オフを切り替え",
         MessageId::CmdShareDescription => "現在のセッションを共有可能な Web URL としてエクスポート",
         MessageId::CmdJobsDescription => "バックグラウンドのシェルジョブを確認・制御",
@@ -1295,6 +1303,9 @@ fn chinese_simplified(id: MessageId) -> Option<&'static str> {
         MessageId::CmdHooksDescription => "列出已配置的生命周期钩子（只读）",
         MessageId::CmdGoalDescription => "设置带有可选令牌预算的会话目标",
         MessageId::CmdInitDescription => "为项目生成 AGENTS.md",
+        MessageId::CmdInjectDescription => {
+            "将项目全部源代码和文档注入到提示词中"
+        }
         MessageId::CmdLspDescription => "切换 LSP 诊断的开启或关闭",
         MessageId::CmdShareDescription => "将当前会话导出为可共享的 Web URL",
         MessageId::CmdJobsDescription => "查看并管理后台 shell 作业",
@@ -1552,6 +1563,9 @@ fn portuguese_brazil(id: MessageId) -> Option<&'static str> {
             "Definir uma meta de sessão com orçamento de tokens opcional"
         }
         MessageId::CmdInitDescription => "Gerar AGENTS.md para o projeto",
+        MessageId::CmdInjectDescription => {
+            "Injetar todo o código fonte e documentação do projeto no prompt"
+        }
         MessageId::CmdLspDescription => "Alternar diagnóstico LSP ligado ou desligado",
         MessageId::CmdShareDescription => "Exportar a sessão atual como uma URL web compartilhável",
         MessageId::CmdJobsDescription => "Inspecionar e controlar jobs de shell em segundo plano",

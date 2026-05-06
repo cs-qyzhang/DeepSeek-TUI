@@ -11,6 +11,7 @@ mod cycle;
 mod debug;
 mod goal;
 mod hooks;
+mod inject;
 mod init;
 mod jobs;
 mod mcp;
@@ -479,6 +480,13 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "/cache [count]",
         description_id: MessageId::CmdCacheDescription,
     },
+    // Full-project code injection
+    CommandInfo {
+        name: "inject-full-codes",
+        aliases: &["inject"],
+        usage: "/inject-full-codes",
+        description_id: MessageId::CmdInjectDescription,
+    },
 ];
 
 /// Execute a slash command
@@ -523,6 +531,7 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "sessions" | "resume" => session::sessions(app, arg),
         "load" => session::load(app, arg),
         "compact" => session::compact(app),
+        "inject-full-codes" | "inject" => inject::inject_full_codes(app),
         "cycles" => cycle::list_cycles(app),
         "cycle" => cycle::show_cycle(app, arg),
         "recall" => cycle::recall_archive(app, arg),

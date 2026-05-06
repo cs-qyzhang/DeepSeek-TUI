@@ -107,6 +107,7 @@ impl DeepSeekClient {
         );
 
         let url = api_url(&self.base_url, "chat/completions");
+        let start = std::time::Instant::now();
         let open_timeout = stream_open_timeout();
         let response = match tokio_timeout(
             open_timeout,
@@ -134,7 +135,18 @@ impl DeepSeekClient {
         let response_text = response.text().await.unwrap_or_default();
         let value: Value =
             serde_json::from_str(&response_text).context("Failed to parse Chat API JSON")?;
-        parse_chat_message(&value)
+        let result = parse_chat_message(&value)?;
+
+        super::api_log::log_api_call(
+            &request.model,
+            "chat/completions",
+            &body,
+            status.as_u16(),
+            Some(&value),
+            start.elapsed(),
+        );
+
+        Ok(result)
     }
 }
 
@@ -195,6 +207,7 @@ impl DeepSeekClient {
         );
 
         let url = api_url(&self.base_url, "chat/completions");
+        let start = std::time::Instant::now();
         let response = self
             .send_with_retry(|| self.http_client.post(&url).json(&body))
             .await?;
@@ -210,6 +223,16 @@ impl DeepSeekClient {
             }
             anyhow::bail!("SSE stream request failed: HTTP {status}: {error_text}");
         }
+
+        // Log streaming request (no full response body available).
+        super::api_log::log_api_call(
+            &request.model,
+            "chat/completions (stream)",
+            &body,
+            status.as_u16(),
+            None,
+            start.elapsed(),
+        );
 
         let model = request.model.clone();
 
@@ -1647,7 +1670,6 @@ mod stream_decoder_tests {
             .expect("tool-use block present");
         assert_eq!(id, "call_xyz");
     }
-
     #[test]
     fn request_builder_preserves_internal_system_messages() {
         let messages = vec![Message {
