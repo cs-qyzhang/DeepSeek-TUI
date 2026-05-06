@@ -1,12 +1,16 @@
 //! Full-project code injection command: `/inject-full-codes`
 //!
 //! Walks the workspace directory using the `ignore` crate (respecting
-//! `.gitignore`, `.ignore`, `.agentignore`, `.deepseekignore`) and collects all source
+//! `.gitignore`, `.ignore`, `.deepseekignore`) and collects all source.
+//! If a `.agentsee` file exists at the workspace root, it acts as an
+//! include filter (gitignore syntax, but patterns specify what to include;
+//! `!` patterns specify what to force-exclude).
 //! code and documentation files. Each file's full content is read and
 //! formatted as a Markdown code fence, then injected into the prompt as
 //! a user message. Designed for small-to-medium projects leveraging
 //! DeepSeek's 1M-token context window.
 
+use glob::Pattern;
 use ignore::WalkBuilder;
 use std::path::Path;
 
@@ -41,6 +45,109 @@ const PROJECT_EXTENSIONS: &[&str] = &[
 /// the system prompt, conversation history, and model response.
 const MAX_TOTAL_BYTES: usize = 800_000;
 
+/// Parsed `.agentsee` include filter.
+///
+/// Gitignore syntax, but inverted: patterns specify what to **include**,
+/// and lines starting with `!` specify what to **force-exclude** (taking
+/// priority over include patterns).  When no `.agentsee` file exists,
+/// every file passes the filter.
+struct Agentsee {
+    includes: Vec<Pattern>,
+    excludes: Vec<Pattern>,
+}
+
+impl Agentsee {
+    /// Load `.agentsee` from the workspace root.  Returns `None` when the
+    /// file is missing or empty — callers should include all files.
+    fn load(workspace: &Path) -> Option<Self> {
+        let path = workspace.join(".agentsee");
+        let content = std::fs::read_to_string(&path).ok()?;
+        if content.trim().is_empty() {
+            return None;
+        }
+
+        let mut includes = Vec::new();
+        let mut excludes = Vec::new();
+
+        for raw in content.lines() {
+            let line = raw.trim();
+            // Skip blank lines and comments.
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let (negated, pat_str) = if let Some(rest) = line.strip_prefix('!') {
+                (true, rest.trim())
+            } else {
+                (false, line)
+            };
+
+            // Convert gitignore-style glob to standard glob syntax.
+            let glob = gitignore_to_glob(pat_str);
+            let Ok(pattern) = Pattern::new(&glob) else {
+                continue;
+            };
+
+            if negated {
+                excludes.push(pattern);
+            } else {
+                includes.push(pattern);
+            }
+        }
+
+        if includes.is_empty() {
+            // No positive patterns → include nothing.
+            return Some(Self {
+                includes: Vec::new(),
+                excludes,
+            });
+        }
+
+        Some(Self { includes, excludes })
+    }
+
+    /// Returns `true` when the workspace-relative path should be included.
+    fn is_included(&self, rel: &str) -> bool {
+        // Exclude patterns take priority.
+        if self.excludes.iter().any(|p| p.matches(rel)) {
+            return false;
+        }
+        // Must match at least one include pattern.
+        self.includes.iter().any(|p| p.matches(rel))
+    }
+}
+
+/// Convert a gitignore-style glob pattern to a standard glob pattern
+/// compatible with the `glob` crate.
+///
+/// Transformations:
+/// - Trailing `/` → `/**` (match directory and all descendants)
+/// - Leading `/` is stripped (gitignore anchors; we always match relative
+///   to the workspace root)
+/// - `**` is already valid glob syntax
+/// - `*` and `?` are already valid glob syntax
+fn gitignore_to_glob(pat: &str) -> String {
+    let pat = pat.trim();
+
+    // Trailing `/` means "directory and everything under it".
+    if let Some(prefix) = pat.strip_suffix('/') {
+        return format!("{prefix}/**");
+    }
+
+    // Strip leading `/` — gitignore uses it to anchor to root, but our
+    // relative paths are already anchored.
+    let pat = pat.strip_prefix('/').unwrap_or(pat);
+
+    // If the pattern doesn't start with `*` or `**`, prepend `**/` so it
+    // matches at any depth (gitignore default behaviour for non-anchored
+    // patterns).
+    if !pat.starts_with('*') {
+        format!("**/{pat}")
+    } else {
+        pat.to_string()
+    }
+}
+
 /// Result of collecting project files for injection.
 struct InjectPlan {
     /// The formatted injection message text.
@@ -62,6 +169,8 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         return None;
     }
 
+    let agentsee = Agentsee::load(workspace);
+
     let mut files: Vec<(String, String)> = Vec::new(); // (relative path, content)
     let mut total_bytes: usize = 0;
     let mut skipped_count: usize = 0;
@@ -73,7 +182,6 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         .git_ignore(true)
         .git_exclude(true)
         .git_global(true);
-    let _ = builder.add_custom_ignore_filename(".agentignore");
     let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
     for entry in builder.build().flatten() {
@@ -90,6 +198,16 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
             continue;
         }
 
+        let rel = path.strip_prefix(workspace).unwrap_or(path);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+        // Apply `.agentsee` filter if present.
+        if let Some(ref see) = agentsee
+            && !see.is_included(&rel_str)
+        {
+            continue;
+        }
+
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
@@ -101,9 +219,6 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
             skipped_count += 1;
             continue;
         }
-
-        let rel = path.strip_prefix(workspace).unwrap_or(path);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
 
         total_bytes += content.len();
         files.push((rel_str.to_string(), content));
@@ -354,31 +469,70 @@ mod tests {
     }
 
     #[test]
-    fn inject_respects_agentignore() {
+    fn inject_respects_agentsee() {
         let tmpdir = TempDir::new().unwrap();
-        fs::write(tmpdir.path().join(".agentignore"), "excluded/\nsecret.py\n").unwrap();
+        // Only include .rs and .py files, exclude anything in excluded/
+        fs::write(
+            tmpdir.path().join(".agentsee"),
+            "*.rs\n*.py\n!excluded/\n",
+        )
+        .unwrap();
         fs::create_dir(tmpdir.path().join("excluded")).unwrap();
         fs::write(tmpdir.path().join("excluded/hidden.rs"), "fn hidden() {}").unwrap();
         fs::write(tmpdir.path().join("secret.py"), "print('secret')").unwrap();
-        fs::write(tmpdir.path().join("visible.py"), "print('visible')").unwrap();
+        fs::write(tmpdir.path().join("visible.rs"), "fn visible() {}").unwrap();
+        // This markdown file should NOT appear because it isn't in .agentsee
+        fs::write(tmpdir.path().join("README.md"), "# not listed").unwrap();
+        // This excluded .py should NOT appear because excluded/ is force-excluded
+        fs::write(tmpdir.path().join("excluded/keep.py"), "print('nope')").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
         let result = inject_full_codes(&mut app);
 
         match result.action {
             Some(AppAction::SendMessage(content)) => {
+                // Included by pattern
                 assert!(
-                    content.contains("visible.py"),
-                    "visible file should be included; content: {content}"
+                    content.contains("visible.rs"),
+                    "visible.rs should be included; content: {content}"
                 );
                 assert!(
-                    !content.contains("secret.py"),
-                    ".agentignore-listed file should be excluded; content: {content}"
+                    content.contains("secret.py"),
+                    "secret.py should be included; content: {content}"
                 );
+                // Excluded by ! pattern
                 assert!(
                     !content.contains("hidden.rs"),
-                    ".agentignore-listed directory should be excluded; content: {content}"
+                    "hidden.rs in excluded/ should be force-excluded; content: {content}"
                 );
+                assert!(
+                    !content.contains("keep.py"),
+                    "keep.py in excluded/ should be force-excluded; content: {content}"
+                );
+                // Not in .agentsee at all
+                assert!(
+                    !content.contains("README.md"),
+                    "README.md should not be included (not in .agentsee); content: {content}"
+                );
+            }
+            other => panic!("expected SendMessage action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inject_no_agentsee_includes_all() {
+        // Without .agentsee, behavior is unchanged — all recognized files included.
+        let tmpdir = TempDir::new().unwrap();
+        fs::write(tmpdir.path().join("a.rs"), "fn a() {}").unwrap();
+        fs::write(tmpdir.path().join("b.py"), "print('b')").unwrap();
+
+        let mut app = create_test_app_in(&tmpdir);
+        let result = inject_full_codes(&mut app);
+
+        match result.action {
+            Some(AppAction::SendMessage(content)) => {
+                assert!(content.contains("a.rs"));
+                assert!(content.contains("b.py"));
             }
             other => panic!("expected SendMessage action, got: {other:?}"),
         }
