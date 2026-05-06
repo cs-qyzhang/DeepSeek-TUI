@@ -613,6 +613,24 @@ fn relativize_candidate(
         .unwrap_or_else(|| candidate.ends_with('/'));
 
     let rel_string = path_to_string(&rel_path)?;
+
+    // Reject empty relative paths — these arise when the candidate is the
+    // workspace root itself (e.g. an absolute workspace path was extracted
+    // from a message and strip_prefix yields an empty remainder).
+    if rel_string.is_empty() {
+        return None;
+    }
+
+    // Reject paths that don't exist on disk. The regex-based path extraction
+    // produces many false positives from URLs, injected code snippets, and
+    // other non-path text. Only paths verifiable via `fs::metadata` make
+    // it into the working set — this also keeps the prompt summary block
+    // clean of phantom entries like "5432/app" or "config.yaml" that were
+    // mentioned in source code but aren't real workspace files.
+    if !exists {
+        return None;
+    }
+
     Some((rel_string, exists, is_dir))
 }
 
@@ -1175,6 +1193,75 @@ mod tests {
         assert!(
             entries.iter().any(|e| e == "alphabeta.txt"),
             "expected cwd entry alphabeta.txt; got: {entries:?}",
+        );
+    }
+
+    #[test]
+    fn observe_user_message_rejects_url_port_fragments() {
+        let tmp = TempDir::new().expect("tempdir");
+        fs::write(tmp.path().join("main.py"), "print('hi')").expect("write");
+
+        let mut ws = WorkingSet::default();
+        // Simulate injected content containing a database URL
+        ws.observe_user_message(
+            "## Full Project Code Injection\n\n\
+             ### `main.py`\n\n```python\n\
+             DB_URL = \"postgresql://localhost:5432/app\"\n\
+             ```",
+            tmp.path(),
+        );
+
+        // Should NOT have a "5432/app" entry
+        assert!(
+            !ws.entries.contains_key("5432/app"),
+            "URL port fragment 5432/app should be rejected; entries: {:?}",
+            ws.entries.keys().collect::<Vec<_>>()
+        );
+        // Should still have the real file
+        assert!(ws.entries.contains_key("main.py"));
+    }
+
+    #[test]
+    fn observe_user_message_rejects_workspace_path_as_empty_entry() {
+        let tmp = TempDir::new().expect("tempdir");
+        fs::write(tmp.path().join("README.md"), "# Project").expect("write");
+
+        let mut ws = WorkingSet::default();
+        let workspace_str = tmp.path().display().to_string();
+        // Simulate injected content that includes the workspace path
+        ws.observe_user_message(
+            &format!(
+                "## Full Project Code Injection\n\n\
+                 Workspace: {}\n\n\
+                 ### `README.md`\n\n```markdown\n# Project\n```",
+                workspace_str
+            ),
+            tmp.path(),
+        );
+
+        // Should NOT have an empty-path entry
+        assert!(
+            !ws.entries.contains_key(""),
+            "empty-path entry should be rejected; entries: {:?}",
+            ws.entries.keys().collect::<Vec<_>>()
+        );
+        // Should still have the real file
+        assert!(ws.entries.contains_key("README.md"));
+    }
+
+    #[test]
+    fn observe_user_message_rejects_empty_path_from_workspace_match() {
+        use std::path::Path;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let ws_path = tmp.path().to_string_lossy().to_string();
+
+        // Directly test relativize_candidate with the workspace path
+        let (candidate, workspace, canon) = (ws_path.as_str(), Path::new(&ws_path), None::<&Path>);
+        let result = relativize_candidate(candidate, workspace, canon);
+        assert!(
+            result.is_none(),
+            "workspace root path should relativize to empty and be rejected; got: {result:?}"
         );
     }
 
