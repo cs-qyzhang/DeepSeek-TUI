@@ -156,8 +156,8 @@ struct InjectPlan {
     total_bytes: usize,
     /// Number of files skipped due to budget.
     skipped_count: usize,
-    /// Workspace-relative paths of included files (sorted).
-    files: Vec<String>,
+    /// Per-file token estimates: (rel_path, estimated_tokens) in priority order.
+    file_tokens: Vec<(String, usize)>,
 }
 
 /// Walk the workspace and build the injection message text.
@@ -228,6 +228,7 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
 
     // Pass 2: read files in priority order, accumulating up to budget.
     let mut files: Vec<(String, String)> = Vec::new(); // (relative path, content)
+    let mut file_tokens: Vec<(String, usize)> = Vec::new();
     let mut total_bytes: usize = 0;
     let mut skipped_count: usize = 0;
 
@@ -244,6 +245,8 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
             continue;
         }
 
+        let content_tokens = content.chars().count().div_ceil(4);
+        file_tokens.push((rel_str.clone(), content_tokens));
         total_bytes += content.len();
         files.push((rel_str.clone(), content));
     }
@@ -282,14 +285,12 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         skipped_note
     ));
 
-    let file_paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
-
     Some(InjectPlan {
         message: msg,
         file_count: files.len(),
         total_bytes,
         skipped_count,
-        files: file_paths,
+        file_tokens,
     })
 }
 
@@ -343,10 +344,23 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
         String::new()
     };
 
+    // Build per-file breakdown in priority order.
+    let max_path_len = plan
+        .file_tokens
+        .iter()
+        .map(|(p, _)| p.len())
+        .max()
+        .unwrap_or(0)
+        .max(8);
     let mut file_list = String::new();
-    for f in &plan.files {
-        file_list.push_str(&format!("  {f}\n"));
+    let mut content_sum: usize = 0;
+    for (path, tokens) in &plan.file_tokens {
+        content_sum += tokens;
+        let padding = " ".repeat(max_path_len.saturating_sub(path.len()) + 2);
+        file_list.push_str(&format!("  {path}{padding}~{tokens} tokens\n"));
     }
+    // Add framing overhead estimate
+    let framing_tokens = char_count.div_ceil(4).saturating_sub(content_sum);
 
     CommandResult::message(format!(
         "Full Codes Token Estimate\n\
@@ -354,15 +368,19 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
          Files: {}\n\
          Content size: ~{} KB\n\
          Message chars: {}\n\
-         Estimated tokens: ~{}  (~4 chars/token heuristic){}\n\
+         Estimated tokens: ~{}  (~4 chars/token heuristic)\n\
+           content: ~{}\n\
+           framing: ~{}{}\n\
          \n\
-         Files that would be injected:\n\
+         Per-file breakdown (priority order):\n\
          {}",
         app.workspace.display(),
         plan.file_count,
         kb,
         char_count,
         token_estimate,
+        content_sum,
+        framing_tokens,
         skipped_line,
         file_list,
     ))
