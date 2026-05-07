@@ -98,6 +98,8 @@ memory_path = "~/.deepseek/memory.md"
 # Security
 # ─────────────────────────────────────────────────────────────────────────────────
 allow_shell = true
+# enable_api_log = true      # Write every LLM request/response to ~/.deepseek/api-logs/
+#                            # as YAML files. Off by default — uncomment to activate.
 approval_policy = "on-request" # on-request | untrusted | never
 sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-access | external-sandbox
 
@@ -141,12 +143,12 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 max_subagents = 10 # optional (1-20)
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# Full Code Injection (/inject-full-codes)
+# Full Code Injection (/inject-files, /inject-estimate)
 # ─────────────────────────────────────────────────────────────────────────────────
 # Soft cap on the total token budget for injected file content. Files are read
 # in priority order (as declared in .agentsee); lower-priority files that would
 # push the total past this limit are skipped. Defaults to 200 000 tokens
-# (~800 KB) when unset.  Override per invocation with `/inject --max-tokens N`.
+# (~800 KB) when unset.  Override per invocation with `/inject-files --max-tokens N`.
 # max_inject_tokens = 200000
 
 # Optional sub-agent tuning. max_concurrent overrides top-level max_subagents.

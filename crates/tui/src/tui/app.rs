@@ -742,9 +742,9 @@ pub struct App {
     pub max_input_history: usize,
     pub allow_shell: bool,
     pub max_subagents: usize,
-    /// Maximum tokens for `/inject-full-codes` content (soft cap).
+    /// Maximum tokens for `/inject-files` content (soft cap).
     /// Defaults to 200 000 tokens (~800 KB) from config; overridable via
-    /// `/inject --max-tokens N`.
+    /// `/inject-files --max-tokens N`.
     pub max_inject_tokens: usize,
     /// Cached sub-agent snapshots for UI views.
     pub subagent_cache: Vec<SubAgentResult>,
@@ -1248,6 +1248,9 @@ impl App {
             }
             _ => (String::new(), 0),
         };
+        crate::client::api_log::set_enabled(
+            config.enable_api_log.unwrap_or(false),
+        );
         Self {
             mode: initial_mode,
             composer: ComposerState {

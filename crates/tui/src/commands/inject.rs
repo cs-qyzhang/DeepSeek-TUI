@@ -1,17 +1,63 @@
-//! Full-project code injection command: `/inject-full-codes`
+//! Full-project code injection commands: `/inject-files` and `/inject-estimate`
 //!
-//! Walks the workspace directory using the `ignore` crate (respecting
-//! `.gitignore`, `.ignore`, `.deepseekignore`) and injects every file
-//! matched by the `.agentsee` include filter. Each file's full content
-//! is injected into the conversation as a synthetic `read_file` tool-call
-//! / tool-result pair so the model sees the files exactly as it would see
-//! real tool output — same format, same content-compaction path, no
-//! special framing.
+//! These commands walk the workspace using the `ignore` crate (respecting
+//! `.gitignore`, `.ignore`, `.deepseekignore`) and inject files matched by
+//! the `.agentsee` include filter into the conversation as synthetic
+//! `read_file` tool-call / tool-result pairs.  The model sees the files
+//! exactly as it would see real tool output — same format, same
+//! content-compaction path, no special framing.
+//!
+//! # The `.agentsee` file
 //!
 //! A `.agentsee` file **must** exist at the workspace root.  It uses
 //! gitignore syntax, but inverted: patterns specify what to **include**;
 //! `!` patterns specify what to **force-exclude**.  Pattern matching
 //! follows gitignore semantics: last matching pattern wins.
+//!
+//! ## Syntax
+//!
+//! | Pattern | Matches |
+//! |---------|---------|
+//! | `*.rs` | All Rust files at any depth |
+//! | `src/` | Everything under `src/` |
+//! | `/README.md` | Only the root README |
+//! | `docs/**/*.md` | Markdown files anywhere under `docs/` |
+//! | `!tests/` | Force-exclude everything under `tests/` |
+//! | `!**/*_test.rs` | Force-exclude test files |
+//!
+//! ## Priority
+//!
+//! When the token budget is tight, files are collected in priority order:
+//! patterns listed earlier have higher priority.  Within the same pattern,
+//! more-specific patterns (those containing `/`) beat bare filename patterns;
+//! longer patterns beat shorter ones.
+//!
+//! # Commands
+//!
+//! ## `/inject-files [--max-tokens N] [user text]`
+//!
+//! Alias: `/inject`
+//!
+//! Reads all files matched by `.agentsee` (up to the token budget) and
+//! injects them as synthetic `read_file` tool calls into the conversation.
+//! If `user text` is supplied it is appended as a final user message,
+//! triggering the next turn with both the project context and the request
+//! immediately available.
+//!
+//! ## `/inject-estimate [--max-tokens N]`
+//!
+//! Dry-run that counts matching files and estimates their total token
+//! footprint without injecting anything.  Shows per-file breakdown in
+//! priority order plus framing overhead.
+//!
+//! # Token budget
+//!
+//! Controlled by two layers (highest wins):
+//!
+//! 1. `--max-tokens N` command argument — per-invocation override
+//! 2. `max_inject_tokens` in config.toml — session default (default: 200 000)
+//!
+//! Files beyond the budget are skipped in reverse priority order.
 
 use glob::Pattern;
 use ignore::WalkBuilder;
@@ -299,7 +345,7 @@ fn collect_project_files(workspace: &Path, max_bytes: usize) -> Option<InjectPla
     })
 }
 
-/// Parse the `/inject` or `/fct` command argument for an optional
+/// Parse the `/inject-files` or `/inject-estimate` argument for an optional
 /// `--max-tokens N` prefix.  Returns `(override_tokens, user_text)`.
 fn parse_inject_arg(arg: Option<&str>) -> (Option<usize>, Option<String>) {
     let arg = match arg {
@@ -339,10 +385,10 @@ fn parse_inject_arg(arg: Option<&str>) -> (Option<usize>, Option<String>) {
 /// Each file produces one assistant/user message pair, yielding a
 /// sequential read_file(1) → result(1) → read_file(2) → result(2) pattern.
 ///
-/// When `user_text` is present (e.g. from `/inject 总结项目内容`), it is
+/// When `user_text` is present (e.g. from `/inject-files summarize this project`), it is
 /// appended as a final user message after all tool results so the model
 /// receives both the full project context and the user's request.
-pub fn inject_full_codes(app: &mut App, raw_arg: Option<String>) -> CommandResult {
+pub fn inject_files(app: &mut App, raw_arg: Option<String>) -> CommandResult {
     let (max_tokens_override, user_text) =
         parse_inject_arg(raw_arg.as_deref());
     let max_tokens = max_tokens_override.unwrap_or(app.max_inject_tokens);
@@ -462,7 +508,7 @@ pub fn inject_full_codes(app: &mut App, raw_arg: Option<String>) -> CommandResul
 
 /// Dry-run the injection and estimate how many tokens the full set of
 /// messages would consume. Does NOT modify the conversation.
-pub fn full_codes_tokens(app: &App, raw_arg: Option<String>) -> CommandResult {
+pub fn inject_estimate(app: &App, raw_arg: Option<String>) -> CommandResult {
     let (max_tokens_override, _user_text) =
         parse_inject_arg(raw_arg.as_deref());
     let max_tokens = max_tokens_override.unwrap_or(app.max_inject_tokens);
@@ -471,7 +517,7 @@ pub fn full_codes_tokens(app: &App, raw_arg: Option<String>) -> CommandResult {
     if !app.workspace.join(".agentsee").exists() {
         return CommandResult::message(
             "No .agentsee file found at workspace root. \
-             Create one first, then use /full-codes-tokens to estimate.",
+             Create one first, then use /inject-estimate to estimate.",
         );
     }
     let Some(plan) = collect_project_files(&app.workspace, max_bytes) else {
@@ -607,7 +653,7 @@ mod tests {
     fn inject_empty_workspace_returns_message() {
         let tmpdir = TempDir::new().unwrap();
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let result = inject_files(&mut app, None);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(
@@ -626,7 +672,7 @@ mod tests {
         fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let result = inject_files(&mut app, None);
 
         assert!(result.message.is_some());
         let status = result.message.unwrap();
@@ -671,7 +717,7 @@ mod tests {
         fs::write(tmpdir.path().join("excluded/keep.py"), "print('nope')").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         // Included by pattern
@@ -730,7 +776,7 @@ mod tests {
         fs::write(tmpdir.path().join("excluded/keep.py"), "print('kept')").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         assert!(
@@ -753,7 +799,7 @@ mod tests {
         fs::write(tmpdir.path().join("small.rs"), "fn main() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         // Cargo.toml (high priority) should be included
@@ -783,7 +829,7 @@ mod tests {
         fs::write(tmpdir.path().join("README.md"), "# readme").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         // core/utils/ has higher priority → helpers.py first
@@ -815,7 +861,7 @@ mod tests {
         fs::write(tmpdir.path().join("README.md"), "# root readme").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         assert!(paths.contains(&"README.md".to_string()));
@@ -844,7 +890,7 @@ mod tests {
         fs::write(tmpdir.path().join("b.py"), "print('b')").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let result = inject_files(&mut app, None);
 
         let msg = result.message.unwrap();
         assert!(
@@ -864,7 +910,7 @@ mod tests {
         fs::write(tmpdir.path().join("visible.rs"), "fn visible() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         assert!(paths.contains(&"visible.rs".to_string()), "paths: {paths:?}");
@@ -882,7 +928,7 @@ mod tests {
         fs::write(tmpdir.path().join("real.rs"), "fn real() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         assert!(paths.contains(&"real.rs".to_string()));
@@ -899,7 +945,7 @@ mod tests {
         fs::write(tmpdir.path().join("lib.rs"), "pub fn x() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let _ = inject_full_codes(&mut app, None);
+        let _ = inject_files(&mut app, None);
 
         let paths = injected_paths(&app);
         assert!(paths.contains(&"lib.rs".to_string()));
@@ -913,7 +959,7 @@ mod tests {
         fs::write(tmpdir.path().join("main.rs"), "fn main() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, Some("总结项目内容".to_string()));
+        let result = inject_files(&mut app, Some("summarize this project".to_string()));
 
         assert!(result.message.is_some());
         let status = result.message.unwrap();
@@ -921,7 +967,7 @@ mod tests {
 
         // The trigger for the next turn is the user's text
         assert!(
-            matches!(&result.action, Some(AppAction::SendMessage(t)) if t == "总结项目内容"),
+            matches!(&result.action, Some(AppAction::SendMessage(t)) if t == "summarize this project"),
             "action: {:?}",
             result.action
         );

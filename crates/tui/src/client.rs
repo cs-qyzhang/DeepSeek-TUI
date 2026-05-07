@@ -972,7 +972,7 @@ impl DeepSeekClient {
     }
 }
 
-mod api_log;
+pub(crate) mod api_log;
 mod chat;
 
 #[cfg(test)]

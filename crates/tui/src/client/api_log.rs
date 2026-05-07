@@ -1,14 +1,17 @@
 //! API call YAML logger — records every LLM HTTP request and its response
 //! to `~/.deepseek/api-logs/` for debugging and audit purposes.
 //!
-//! Enabled by default. Logs are written synchronously via `std::fs::write`
-//! on a best-effort basis — a failed write is silently ignored so a full
-//! disk or permission error never blocks the turn.
+//! **Opt-in by default.** Set `enable_api_log = true` in `config.toml` or
+//! `DEEPSEEK_API_LOG_ENABLE=1` to activate.  When enabled, logs are written
+//! synchronously via `std::fs::write` on a best-effort basis — a failed
+//! write is silently ignored so a full disk or permission error never blocks
+//! the turn.
 
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::logging;
@@ -16,12 +19,23 @@ use crate::logging;
 /// Environment variable to override the default log directory.
 const LOG_DIR_ENV: &str = "DEEPSEEK_API_LOG_DIR";
 
-/// Environment variable to disable API logging (set to `1` or `true`).
-const LOG_DISABLE_ENV: &str = "DEEPSEEK_API_LOG_DISABLE";
+/// Environment variable to enable/disable API logging (`1`/`true` = on,
+/// `0`/`false` = off).  Overrides the `enable_api_log` config.toml setting.
+/// When unset, the config value is used.
+const LOG_ENABLE_ENV: &str = "DEEPSEEK_API_LOG_ENABLE";
 
 /// Default max number of log files to keep. Oldest files are pruned when
 /// the directory exceeds this count.
 const MAX_LOG_FILES: usize = 200;
+
+/// Runtime flag set from config at startup. Off by default.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Called once at startup from `App::new()`. When the config file sets
+/// `enable_api_log = true`, logging is activated for this session.
+pub fn set_enabled(yes: bool) {
+    ENABLED.store(yes, Ordering::Relaxed);
+}
 
 /// Structured log entry for one API call.
 #[derive(Debug, Serialize)]
@@ -61,7 +75,7 @@ pub fn log_api_call(
     response_body: Option<&Value>,
     duration: Duration,
 ) {
-    if api_log_disabled() {
+    if !should_log() {
         return;
     }
 
@@ -129,11 +143,19 @@ fn api_log_dir() -> PathBuf {
         .join("api-logs")
 }
 
-fn api_log_disabled() -> bool {
-    std::env::var(LOG_DISABLE_ENV)
-        .ok()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+/// Check whether API logging is active: env var wins over config.
+///
+/// - `DEEPSEEK_API_LOG_ENABLE=1` → on (overrides config)
+/// - `DEEPSEEK_API_LOG_ENABLE=0` → off (overrides config)
+/// - unset → use the config value stored in `ENABLED`
+fn should_log() -> bool {
+    if let Ok(v) = std::env::var(LOG_ENABLE_ENV) {
+        return matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    ENABLED.load(Ordering::Relaxed)
 }
 
 /// Delete oldest log files when the directory exceeds `MAX_LOG_FILES`.
@@ -178,8 +200,9 @@ mod tests {
     #[test]
     fn log_api_call_writes_yaml_file() {
         let _lock = ENV_LOCK.lock().unwrap();
+        set_enabled(true);
         let tmp = TempDir::new().unwrap();
-        unsafe { std::env::remove_var(LOG_DISABLE_ENV) };
+        unsafe { std::env::remove_var(LOG_ENABLE_ENV) };
         unsafe { std::env::set_var(LOG_DIR_ENV, tmp.path().as_os_str()) };
 
         let body = serde_json::json!({
@@ -215,8 +238,9 @@ mod tests {
     #[test]
     fn log_streaming_call_omits_response_body() {
         let _lock = ENV_LOCK.lock().unwrap();
+        set_enabled(true);
         let tmp = TempDir::new().unwrap();
-        unsafe { std::env::remove_var(LOG_DISABLE_ENV) };
+        unsafe { std::env::remove_var(LOG_ENABLE_ENV) };
         unsafe { std::env::set_var(LOG_DIR_ENV, tmp.path().as_os_str()) };
 
         let body = serde_json::json!({"model": "deepseek-v4-pro"});
@@ -244,10 +268,11 @@ mod tests {
     #[test]
     fn disabled_by_env_skips_write() {
         let _lock = ENV_LOCK.lock().unwrap();
+        set_enabled(true); // config says yes, but env var overrides with 0
         let tmp = TempDir::new().unwrap();
         unsafe { std::env::remove_var(LOG_DIR_ENV) };
         unsafe { std::env::set_var(LOG_DIR_ENV, tmp.path().as_os_str()) };
-        unsafe { std::env::set_var(LOG_DISABLE_ENV, "1") };
+        unsafe { std::env::set_var(LOG_ENABLE_ENV, "0") };
 
         let body = serde_json::json!({"model": "test"});
         log_api_call("test", "/", &body, 200, None, Duration::from_millis(1));

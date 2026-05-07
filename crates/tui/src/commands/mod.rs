@@ -482,15 +482,15 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     // Full-project code injection
     CommandInfo {
-        name: "inject-full-codes",
+        name: "inject-files",
         aliases: &["inject"],
-        usage: "/inject-full-codes [--max-tokens N] [user text]",
+        usage: "/inject-files [--max-tokens N] [user text]",
         description_id: MessageId::CmdInjectDescription,
     },
     CommandInfo {
-        name: "full-codes-tokens",
-        aliases: &["inject-tokens", "fct"],
-        usage: "/full-codes-tokens [--max-tokens N]",
+        name: "inject-estimate",
+        aliases: &[],
+        usage: "/inject-estimate [--max-tokens N]",
         description_id: MessageId::CmdFullCodesTokensDescription,
     },
 ];
@@ -537,8 +537,8 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "sessions" | "resume" => session::sessions(app, arg),
         "load" => session::load(app, arg),
         "compact" => session::compact(app),
-        "inject-full-codes" | "inject" => inject::inject_full_codes(app, arg.map(|s| s.to_string())),
-        "full-codes-tokens" | "inject-tokens" | "fct" => inject::full_codes_tokens(app, arg.map(|s| s.to_string())),
+        "inject-files" | "inject" => inject::inject_files(app, arg.map(|s| s.to_string())),
+        "inject-estimate" => inject::inject_estimate(app, arg.map(|s| s.to_string())),
         "cycles" => cycle::list_cycles(app),
         "cycle" => cycle::show_cycle(app, arg),
         "recall" => cycle::recall_archive(app, arg),

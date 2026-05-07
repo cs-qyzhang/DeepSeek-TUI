@@ -775,6 +775,9 @@ pub struct Config {
     /// missing optional file doesn't fail the launch.
     pub instructions: Option<Vec<String>>,
     pub allow_shell: Option<bool>,
+    /// Enable API call logging to `~/.deepseek/api-logs/` (one YAML file per
+    /// LLM request/response).  Off by default — set to `true` to activate.
+    pub enable_api_log: Option<bool>,
     pub approval_policy: Option<String>,
     pub sandbox_mode: Option<String>,
     /// External sandbox backend: `"none"` or `"opensandbox"`.
@@ -788,10 +791,10 @@ pub struct Config {
     pub managed_config_path: Option<String>,
     pub requirements_path: Option<String>,
     pub max_subagents: Option<usize>,
-    /// Maximum tokens for `/inject-full-codes` output (soft cap on total file
+    /// Maximum tokens for `/inject-files` output (soft cap on total file
     /// content bytes, converted at ~4 bytes/token).  Defaults to 200 000 tokens
-    /// (~800 KB) when unset.  The `/inject --max-tokens N` command argument
-    /// overrides this value for a single invocation.
+    /// (~800 KB) when unset.  The `/inject-files --max-tokens N` command
+    /// argument overrides this value for a single invocation.
     pub max_inject_tokens: Option<usize>,
     pub retry: Option<RetryConfig>,
     pub capacity: Option<CapacityConfig>,
@@ -2363,6 +2366,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         // both — they list `~/global.md` inside the project array.
         instructions: override_cfg.instructions.or(base.instructions),
         allow_shell: override_cfg.allow_shell.or(base.allow_shell),
+        enable_api_log: override_cfg.enable_api_log.or(base.enable_api_log),
         approval_policy: override_cfg.approval_policy.or(base.approval_policy),
         sandbox_mode: override_cfg.sandbox_mode.or(base.sandbox_mode),
         sandbox_backend: override_cfg.sandbox_backend.or(base.sandbox_backend),
