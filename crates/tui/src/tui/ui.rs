@@ -4347,6 +4347,20 @@ async fn apply_command_result(
                 }
             }
             AppAction::SendMessage(content) => {
+                // Sync api_messages to the engine before sending so
+                // commands (e.g. /inject) that pre-populate api_messages
+                // with tool-call / tool-result pairs are visible to the
+                // engine when it processes the next turn.
+                if !app.api_messages.is_empty() {
+                    let _ = engine_handle
+                        .send(Op::SyncSession {
+                            messages: app.api_messages.clone(),
+                            system_prompt: app.system_prompt.clone(),
+                            model: app.model.clone(),
+                            workspace: app.workspace.clone(),
+                        })
+                        .await;
+                }
                 let queued = build_queued_message(app, content);
                 submit_or_steer_message(app, config, engine_handle, queued).await?;
             }

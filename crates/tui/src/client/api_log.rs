@@ -84,7 +84,7 @@ pub fn log_api_call(
         },
     };
 
-    let yaml = match serde_yaml::to_string(&log) {
+    let yaml = match serde_saphyr::to_string(&log) {
         Ok(y) => y,
         Err(e) => {
             logging::warn(format!("api_log: failed to serialize YAML: {e}"));

@@ -95,9 +95,8 @@ impl Workspace {
         let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut builder = WalkBuilder::new(&self.root);
         builder.hidden(true).follow_links(false).max_depth(Some(6));
-        // Honor project-specific ignore files in addition to the defaults the
-        // `ignore` crate already respects (`.gitignore`, `.git/info/exclude`,
-        // `.ignore`).
+        // Honor `.deepseekignore` in addition to the defaults the `ignore` crate
+        // already respects (`.gitignore`, `.git/info/exclude`, `.ignore`).
         let _ = builder.add_custom_ignore_filename(".deepseekignore");
 
         for entry in builder.build().flatten() {
@@ -624,10 +623,7 @@ fn relativize_candidate(
 
     // Reject paths that don't exist on disk. The regex-based path extraction
     // produces many false positives from URLs, injected code snippets, and
-    // other non-path text. Only paths verifiable via `fs::metadata` make
-    // it into the working set — this also keeps the prompt summary block
-    // clean of phantom entries like "5432/app" or "config.yaml" that were
-    // mentioned in source code but aren't real workspace files.
+    // other non-path text.
     if !exists {
         return None;
     }

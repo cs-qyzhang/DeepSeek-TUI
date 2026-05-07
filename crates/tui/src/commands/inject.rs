@@ -1,76 +1,64 @@
 //! Full-project code injection command: `/inject-full-codes`
 //!
 //! Walks the workspace directory using the `ignore` crate (respecting
-//! `.gitignore`, `.ignore`, `.deepseekignore`) and collects all source.
-//! If a `.agentsee` file exists at the workspace root, it acts as an
-//! include filter (gitignore syntax, but patterns specify what to include;
-//! `!` patterns specify what to force-exclude).
-//! code and documentation files. Each file's full content is read and
-//! formatted as a Markdown code fence, then injected into the prompt as
-//! a user message. Designed for small-to-medium projects leveraging
-//! DeepSeek's 1M-token context window.
+//! `.gitignore`, `.ignore`, `.deepseekignore`) and injects every file
+//! matched by the `.agentsee` include filter. Each file's full content
+//! is injected into the conversation as a synthetic `read_file` tool-call
+//! / tool-result pair so the model sees the files exactly as it would see
+//! real tool output — same format, same content-compaction path, no
+//! special framing.
+//!
+//! A `.agentsee` file **must** exist at the workspace root.  It uses
+//! gitignore syntax, but inverted: patterns specify what to **include**;
+//! `!` patterns specify what to **force-exclude**.  Pattern matching
+//! follows gitignore semantics: last matching pattern wins.
 
 use glob::Pattern;
 use ignore::WalkBuilder;
 use std::path::Path;
 
+use crate::models::{ContentBlock, Message};
 use crate::tui::app::{App, AppAction};
+use crate::tui::history::HistoryCell;
 
 use super::CommandResult;
-
-/// File extensions considered "project source or docs."
-const PROJECT_EXTENSIONS: &[&str] = &[
-    // Rust
-    "rs", "toml",
-    // Configuration
-    "json", "yaml", "yml", "lock",
-    // Documentation
-    "md", "txt", "rst",
-    // Scripts
-    "sh", "bash", "zsh", "py", "rb", "pl",
-    // Web
-    "js", "jsx", "ts", "tsx", "html", "css", "scss", "sass", "less",
-    // Systems
-    "c", "cc", "cpp", "h", "hpp", "go", "java", "kt", "swift",
-    // CI/Config
-    "cfg", "ini", "env", "example",
-    // Data / Query
-    "sql", "graphql", "proto",
-    // Misc text formats
-    "svg", "xml",
-];
 
 /// Hard cap on the total bytes of file content collected.
 /// ~800 KB ≈ 200K tokens at ~4 bytes/token, leaving ~800K tokens for
 /// the system prompt, conversation history, and model response.
 const MAX_TOTAL_BYTES: usize = 800_000;
 
-/// Parsed `.agentsee` include filter.
+/// A parsed include rule from a `.agentsee` line.
 ///
-/// Gitignore syntax, but inverted: patterns specify what to **include**,
-/// and lines starting with `!` specify what to **force-exclude** (taking
-/// priority over include patterns).  Pattern order matters: files matching
-/// earlier lines are given higher priority and will be included first
-/// when the budget is tight.  When no `.agentsee` file exists, every file
-/// passes with equal (lowest) priority.
-/// A compiled include pattern with its original text for specificity
-/// comparison.
+/// Each rule compiles to one or more `glob::Pattern`s that collectively
+/// match the same set of paths as the original gitignore pattern would.
 struct IncludeRule {
-    pattern: Pattern,
-    /// Original pattern text (e.g. "docs/", "*.rs") used to determine
-    /// specificity: directory patterns (containing `/`) are more specific
-    /// than bare filename patterns.
+    /// Compiled glob patterns (any match = the rule matches).
+    patterns: Vec<Pattern>,
+    /// Original pattern text (e.g. "docs/", "*.rs"), used to determine
+    /// specificity for priority tie-breaking.
     original: String,
+    /// Sequential rule number in the `.agentsee` file (0, 1, 2, …).
+    /// Used for both last-match-wins exclusion and priority ordering.
+    position: usize,
 }
 
+/// Parsed `.agentsee` include filter (gitignore syntax, inverted).
+///
+/// Each non-blank, non-comment line is either an include pattern or
+/// (when prefixed with `!`) an exclude pattern.  Patterns are evaluated
+/// in file order; the **last** matching pattern determines whether a
+/// path is included or excluded (gitignore semantics).  When multiple
+/// include patterns match, the most specific one sets the priority.
 struct Agentsee {
     includes: Vec<IncludeRule>,
-    excludes: Vec<Pattern>,
+    /// Exclude rules with their file position for last-match-wins ordering.
+    excludes: Vec<(usize, Vec<Pattern>)>,
 }
 
 impl Agentsee {
     /// Load `.agentsee` from the workspace root.  Returns `None` when the
-    /// file is missing or empty — callers should include all files.
+    /// file is missing or empty.
     fn load(workspace: &Path) -> Option<Self> {
         let path = workspace.join(".agentsee");
         let content = std::fs::read_to_string(&path).ok()?;
@@ -80,10 +68,10 @@ impl Agentsee {
 
         let mut includes = Vec::new();
         let mut excludes = Vec::new();
+        let mut seq: usize = 0; // sequential position across all rule lines
 
         for raw in content.lines() {
             let line = raw.trim();
-            // Skip blank lines and comments.
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -94,97 +82,128 @@ impl Agentsee {
                 (false, line)
             };
 
-            // Convert gitignore-style glob to standard glob syntax.
-            let glob = gitignore_to_glob(pat_str);
-            let Ok(pattern) = Pattern::new(&glob) else {
+            let globs = gitignore_to_glob_patterns(pat_str);
+            let patterns: Vec<Pattern> =
+                globs.iter().filter_map(|g| Pattern::new(g).ok()).collect();
+            if patterns.is_empty() {
+                seq += 1;
                 continue;
-            };
+            }
 
             if negated {
-                excludes.push(pattern);
+                excludes.push((seq, patterns));
             } else {
                 includes.push(IncludeRule {
-                    pattern,
+                    patterns,
                     original: pat_str.to_string(),
+                    position: seq,
                 });
             }
+            seq += 1;
         }
 
         Some(Self { includes, excludes })
     }
 
     /// Returns the priority index (0 = highest) for a workspace-relative
-    /// path, or `None` if it should be excluded.  When `.agentsee` is
-    /// absent, every file passes with max priority.
+    /// path, or `None` if it should be excluded.
     ///
-    /// When a file matches multiple patterns, the most specific one wins
-    /// (longest glob pattern length).  This means `scoutattention/benchmarks`
-    /// takes priority over the broader `scoutattention/` catch-all, and
-    /// `docs/` takes priority over the bare `README.md` pattern.
+    /// Follows gitignore semantics: all rules (includes and excludes) are
+    /// evaluated in file order, and the **last** matching rule wins.  An
+    /// excluded path returns `None`.  When multiple include patterns match,
+    /// specificity breaks the tie: patterns containing `/` beat bare
+    /// filename patterns; among equals, the longer pattern wins.
     fn priority(&self, rel: &str) -> Option<usize> {
-        // Exclude patterns take priority.
-        if self.excludes.iter().any(|p| p.matches(rel)) {
-            return None;
+        // Collect all matching rules: (position, is_include).
+        let mut matches: Vec<(usize, bool)> = Vec::new();
+
+        for rule in &self.includes {
+            if rule.patterns.iter().any(|p| p.matches(rel)) {
+                matches.push((rule.position, true));
+            }
         }
-        // Find all matching patterns and pick the most specific one.
-        // Specificity: original patterns containing `/` (directory patterns)
-        // always beat bare filenames; among equals, longer original text wins.
+        for (pos, patterns) in &self.excludes {
+            if patterns.iter().any(|p| p.matches(rel)) {
+                matches.push((*pos, false));
+            }
+        }
+
+        // Last match by position wins (gitignore semantics).
+        let last = matches.iter().max_by_key(|(pos, _)| pos)?;
+
+        if !last.1 {
+            return None; // last match was an exclude
+        }
+
+        // Priority: find the most specific matching include pattern.
+        // Earlier positions win among equal specificity.
         self.includes
             .iter()
-            .enumerate()
-            .filter(|(_, r)| r.pattern.matches(rel))
-            .max_by_key(|(_, r)| {
-                let is_dir = r.original.contains('/') as usize;
-                (is_dir, r.original.len())
+            .filter(|r| r.patterns.iter().any(|p| p.matches(rel)))
+            .min_by_key(|r| {
+                // Lower sort key = higher priority.
+                // Directory patterns (containing `/`) sort before
+                // bare patterns; among equals, longer is more
+                // specific → negate length so longer sorts first.
+                let is_dir = if r.original.contains('/') { 0 } else { 1 };
+                let neg_len = -(r.original.len() as i64);
+                (is_dir, neg_len, r.position)
             })
-            .map(|(i, _)| i)
+            .map(|r| r.position)
     }
 }
 
-/// Convert a gitignore-style glob pattern to a standard glob pattern
-/// compatible with the `glob` crate.
+/// Convert a single gitignore-style pattern into one or more standard
+/// glob patterns that collectively match the same set of paths.
 ///
-/// Transformations:
-/// - Trailing `/` → `/**` (match directory and all descendants)
-/// - Leading `/` is stripped (gitignore anchors; we always match relative
-///   to the workspace root)
-/// - `**` is already valid glob syntax
-/// - `*` and `?` are already valid glob syntax
-fn gitignore_to_glob(pat: &str) -> String {
+/// Gitignore semantics (as documented in gitignore(5)):
+/// - Patterns without `/` match the file **basename** at any depth.
+/// - Patterns containing `/` are anchored relative to the `.agentsee`
+///   location (workspace root).
+/// - A trailing `/` matches only directories (and their contents).
+/// - A leading `/` anchors to the workspace root (same effect as having
+///   a `/` in the middle for anchoring purposes, but constrains
+///   basename-only patterns to root).
+/// - `!` negation is handled at the rule level, not here.
+fn gitignore_to_glob_patterns(pat: &str) -> Vec<String> {
     let pat = pat.trim();
 
-    // Trailing `/` means "directory and everything under it".
+    // Trailing `/` — matches directories and everything under them.
     if let Some(prefix) = pat.strip_suffix('/') {
-        return format!("{prefix}/**");
+        let prefix = prefix.strip_prefix('/').unwrap_or(prefix);
+        return vec![format!("{prefix}/**")];
     }
 
-    // Strip leading `/` — gitignore uses it to anchor to root, but our
-    // relative paths are already anchored.
-    let pat = pat.strip_prefix('/').unwrap_or(pat);
-
-    // Patterns containing a path separator are directory-like: match the
-    // path and everything recursively under it (e.g. `foo/bar` →
-    // `**/foo/bar/**`).  This matches user intent in an include file:
-    // `scoutattention/benchmarks` means the whole submodule.
-    if pat.contains('/') {
-        return format!("**/{pat}/**");
-    }
-
-    // Bare filename / extension glob: match at any depth.
-    if !pat.starts_with('*') {
-        format!("**/{pat}")
+    // Leading `/` — anchored to root (same dir as .agentsee).
+    let (anchored, body) = if let Some(rest) = pat.strip_prefix('/') {
+        (true, rest)
     } else {
-        pat.to_string()
+        (false, pat)
+    };
+
+    // Contains `/` in the middle — anchored pattern.
+    // Matches both the exact path (if a file) and recursively (if a dir).
+    if body.contains('/') {
+        return vec![body.to_string(), format!("{body}/**")];
+    }
+
+    // No `/` — basename match.
+    if anchored {
+        // `/foo` — match `foo` at root only (file or directory).
+        vec![body.to_string(), format!("{body}/**")]
+    } else {
+        // `*.rs`, `README.md` — match at any depth.
+        vec![format!("**/{body}"), format!("**/{body}/**")]
     }
 }
 
 /// Result of collecting project files for injection.
 struct InjectPlan {
-    /// The formatted injection message text.
-    message: String,
+    /// Collected files: (relative_path, content) in priority order.
+    files: Vec<(String, String)>,
     /// Number of files included.
     file_count: usize,
-    /// Total bytes of file contents (not including markdown framing).
+    /// Total bytes of file contents.
     total_bytes: usize,
     /// Number of files skipped due to budget.
     skipped_count: usize,
@@ -192,18 +211,18 @@ struct InjectPlan {
     file_tokens: Vec<(String, usize)>,
 }
 
-/// Walk the workspace and build the injection message text.
-/// Returns `None` when no project files are found.
+/// Walk the workspace and collect files matched by `.agentsee`.
+/// Returns `None` when no `.agentsee` file exists or no files match.
 ///
-/// When a `.agentsee` file exists, files are collected in priority order:
-/// files matching earlier patterns are read first.  When budget is tight,
-/// later (less important) files are naturally skipped.
-fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
+/// Files are collected in priority order: files matching earlier patterns
+/// are read first.  When budget is tight, later (less important) files are
+/// naturally skipped.
+fn collect_project_files(workspace: &Path) -> Option<InjectPlan> {
     if !workspace.is_dir() {
         return None;
     }
 
-    let agentsee = Agentsee::load(workspace);
+    let agentsee = Agentsee::load(workspace)?;
 
     // Pass 1: collect candidate paths with their priority.
     // (priority, rel_path, abs_path)
@@ -224,28 +243,12 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         }
         let path = entry.path();
 
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        let ext_lower = ext.to_ascii_lowercase();
-        if !PROJECT_EXTENSIONS.contains(&ext_lower.as_str()) {
-            continue;
-        }
-
         let rel = path.strip_prefix(workspace).unwrap_or(path);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
 
-        // Determine priority: lower = more important.
-        let priority = if let Some(ref see) = agentsee {
-            // If the file matches no include pattern, skip it.
-            // `None` means excluded (either by `!` or not matching any include).
-            let Some(p) = see.priority(&rel_str) else {
-                continue;
-            };
-            p
-        } else {
-            // No .agentsee → all files equal (lowest priority).
-            usize::MAX
+        // .agentsee is the sole authority on what to include.
+        let Some(priority) = agentsee.priority(&rel_str) else {
+            continue;
         };
 
         candidates.push((priority, rel_str.to_string(), path.to_path_buf()));
@@ -259,7 +262,7 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
     candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
     // Pass 2: read files in priority order, accumulating up to budget.
-    let mut files: Vec<(String, String)> = Vec::new(); // (relative path, content)
+    let mut files: Vec<(String, String)> = Vec::new();
     let mut file_tokens: Vec<(String, usize)> = Vec::new();
     let mut total_bytes: usize = 0;
     let mut skipped_count: usize = 0;
@@ -283,63 +286,43 @@ fn build_injection_message(workspace: &Path) -> Option<InjectPlan> {
         files.push((rel_str.clone(), content));
     }
 
-    let mut msg = String::with_capacity(total_bytes + files.len() * 64);
-    msg.push_str("## Full Project Code Injection\n\n");
-    msg.push_str(&format!("Workspace: {}\n", workspace.display()));
-    msg.push_str(&format!(
-        "Files included: {} (~{} KB total)\n\n",
-        files.len(),
-        total_bytes / 1024
-    ));
-    msg.push_str(
-        "The following is the complete source code and documentation \
-         for this project. Each file is shown with its workspace-relative \
-         path and full contents.\n\
-         \n\
-         **Important:** these files are already fully available in your \
-         context. Avoid unnecessary `read_file` calls — re-reading wastes \
-         context and duplicates data you already have.\n\n",
-    );
-    msg.push_str("---\n\n");
-
-    for (path, content) in &files {
-        let lang = ext_to_language(path);
-        msg.push_str(&format!("### `{path}`\n\n```{lang}\n{content}\n```\n\n"));
-    }
-
-    let skipped_note = if skipped_count > 0 {
-        format!(" ({} file(s) skipped due to size budget)", skipped_count)
-    } else {
-        String::new()
-    };
-
-    msg.push_str("---\n");
-    msg.push_str(&format!(
-        "*Injected {} files, ~{} KB total.{}\n*",
-        files.len(),
-        total_bytes / 1024,
-        skipped_note
-    ));
-
     Some(InjectPlan {
-        message: msg,
-        file_count: files.len(),
+        files,
+        file_count: file_tokens.len(),
         total_bytes,
         skipped_count,
         file_tokens,
     })
 }
 
-/// Walk the workspace and inject every project file into the prompt.
+/// Walk the workspace and inject every project file into the context as
+/// synthetic `read_file` tool-call / tool-result pairs.
+///
+/// Each file becomes:
+/// - An assistant message with a `ToolUse` block (id = `inj_N`,
+///   name = `read_file`, input = `{"path": "rel/path"}`)
+/// - A user message with a `ToolResult` block carrying the file content.
+///
+/// Each file produces one assistant/user message pair, yielding a
+/// sequential read_file(1) → result(1) → read_file(2) → result(2) pattern.
 ///
 /// When `user_text` is present (e.g. from `/inject 总结项目内容`), it is
-/// appended after the injected code so the model receives both the full
-/// project context and the user's request in a single turn.
+/// appended as a final user message after all tool results so the model
+/// receives both the full project context and the user's request.
 pub fn inject_full_codes(app: &mut App, user_text: Option<String>) -> CommandResult {
-    let Some(plan) = build_injection_message(&app.workspace) else {
+    if !app.workspace.join(".agentsee").exists() {
         return CommandResult::message(
-            "No project files found to inject. Check that the workspace contains \
-             source or documentation files with recognized extensions.",
+            "No .agentsee file found at workspace root.\n\n\
+             Create a .agentsee file to specify which files to inject. \
+             Each line is a gitignore-style pattern for files to INCLUDE \
+             (e.g. \"*.rs\", \"src/\"). Lines starting with ! are force-excluded \
+             (e.g. \"!tests/\").",
+        );
+    }
+    let Some(plan) = collect_project_files(&app.workspace) else {
+        return CommandResult::message(
+            "No files matched the .agentsee patterns. \
+             Check that your patterns match files in the workspace.",
         );
     };
 
@@ -352,39 +335,120 @@ pub fn inject_full_codes(app: &mut App, user_text: Option<String>) -> CommandRes
         String::new()
     };
 
-    // Build the final message: injected code, optionally followed by the
-    // user's request text.
-    let final_msg = if let Some(text) = user_text.filter(|t| !t.trim().is_empty()) {
-        format!("{message}\n\n---\n\n**User request:** {text}", message = plan.message)
+    let file_count = plan.file_count;
+    let total_kb = plan.total_bytes / 1024;
+
+    // --- Header: system cell in transcript only (not in api_messages) ---
+    let header_text = format!(
+        "## Full Project Code Injection\n\n\
+         Workspace: {}\n\
+         Files injected: {} (~{} KB total){}\n\n\
+         The following files have been loaded via read_file calls and are \
+         now available in your context.",
+        app.workspace.display(),
+        file_count,
+        total_kb,
+        skipped_note,
+    );
+    app.push_history_cell(HistoryCell::System {
+        content: header_text.clone(),
+    });
+
+    // --- Tool calls: one assistant/user pair per file (sequential) ---
+    for (i, (rel_path, content)) in plan.files.iter().enumerate() {
+        let tool_id = format!("inj_{i}");
+
+        // Assistant message: the read_file tool call
+        app.api_messages.push(Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: tool_id.clone(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": rel_path}),
+                caller: None,
+            }],
+        });
+
+        // User message: the tool result with file content
+        app.api_messages.push(Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_id,
+                content: content.clone(),
+                is_error: None,
+                content_blocks: None,
+            }],
+        });
+    }
+
+    // --- History cells for display ---
+    // Add a system cell summarizing the tool calls so the user sees what
+    // happened in the transcript — tool messages don't produce visible
+    // history cells on their own.
+    // Wrap each path in backticks so the markdown renderer treats the
+    // content as inline code, suppressing bold/italic interpretation of
+    // underscores (e.g. __init__.py).
+    let mut file_list = String::new();
+    for (path, _content) in &plan.files {
+        file_list.push_str(&format!("  `{path}`\n"));
+    }
+    app.push_history_cell(HistoryCell::System {
+        content: format!(
+            "Injected {} files as read_file calls:\n{file_list}",
+            file_count,
+        ),
+    });
+
+    app.mark_history_updated();
+
+    // --- Optional user text: a final user message that triggers the turn ---
+    // Push the user text (or a minimal trigger if none) into api_messages
+    // and send it to the engine. The engine must sync api_messages first
+    // so it sees the tool calls — the SendMessage handler in the event loop
+    // is patched to sync before dispatching.
+    let trigger_text = if let Some(text) = user_text.filter(|t| !t.trim().is_empty()) {
+        text
     } else {
-        plan.message
+        // Without user text, send the header as the triggering user message.
+        header_text
     };
 
     CommandResult::with_message_and_action(
         format!(
-            "Injected {} files (~{} KB) into context{}",
-            plan.file_count,
-            plan.total_bytes / 1024,
-            skipped_note
+            "Injected {} files (~{} KB) into context as read_file calls{}",
+            file_count, total_kb, skipped_note
         ),
-        AppAction::SendMessage(final_msg),
+        AppAction::SendMessage(trigger_text),
     )
 }
 
-/// Dry-run the injection and estimate how many tokens the full message
-/// would consume. Does NOT send any message or modify the conversation.
+/// Dry-run the injection and estimate how many tokens the full set of
+/// messages would consume. Does NOT modify the conversation.
 pub fn full_codes_tokens(app: &App) -> CommandResult {
-    let Some(plan) = build_injection_message(&app.workspace) else {
+    if !app.workspace.join(".agentsee").exists() {
         return CommandResult::message(
-            "No project files found for estimation. Check that the workspace \
-             contains source or documentation files with recognized extensions.",
+            "No .agentsee file found at workspace root. \
+             Create one first, then use /full-codes-tokens to estimate.",
+        );
+    }
+    let Some(plan) = collect_project_files(&app.workspace) else {
+        return CommandResult::message(
+            "No files matched the .agentsee patterns.",
         );
     };
 
-    // Conservative token estimate: ~4 chars per token for English / code.
-    let char_count = plan.message.chars().count();
-    let token_estimate = char_count.div_ceil(4);
     let kb = plan.total_bytes / 1024;
+
+    // Estimate tokens for the header message + tool calls + tool results.
+    let header_char_count = 256; // rough estimate for the header text
+    let mut total_chars = header_char_count;
+    // Each tool call: ~"read_file" + path + JSON framing ≈ path.len() + 64
+    // Each tool result: file content + tool_use_id ≈ content.len() + 32
+    for (path, tokens) in &plan.file_tokens {
+        total_chars += path.len() + 64; // tool use
+        total_chars += tokens.saturating_mul(4) + 32; // tool result (tokens→chars approximation)
+    }
+    let token_estimate = total_chars.div_ceil(4);
 
     let skipped_line = if plan.skipped_count > 0 {
         format!("\nFiles skipped (budget): {}", plan.skipped_count)
@@ -393,10 +457,11 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
     };
 
     // Build per-file breakdown in priority order.
+    // +2 for the backtick wrappers around each path.
     let max_path_len = plan
         .file_tokens
         .iter()
-        .map(|(p, _)| p.len())
+        .map(|(p, _)| p.len() + 2)
         .max()
         .unwrap_or(0)
         .max(8);
@@ -404,18 +469,16 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
     let mut content_sum: usize = 0;
     for (path, tokens) in &plan.file_tokens {
         content_sum += tokens;
-        let padding = " ".repeat(max_path_len.saturating_sub(path.len()) + 2);
-        file_list.push_str(&format!("  {path}{padding}~{tokens} tokens\n"));
+        let padding = " ".repeat(max_path_len.saturating_sub(path.len() + 2) + 2);
+        file_list.push_str(&format!("  `{path}`{padding}~{tokens} tokens\n"));
     }
-    // Add framing overhead estimate
-    let framing_tokens = char_count.div_ceil(4).saturating_sub(content_sum);
+    let framing_tokens = token_estimate.saturating_sub(content_sum);
 
     CommandResult::message(format!(
-        "Full Codes Token Estimate\n\
+        "Full Codes Token Estimate (as read_file tool calls)\n\
          Workspace: {}\n\
          Files: {}\n\
          Content size: ~{} KB\n\
-         Message chars: {}\n\
          Estimated tokens: ~{}  (~4 chars/token heuristic)\n\
            content: ~{}\n\
            framing: ~{}{}\n\
@@ -425,55 +488,12 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
         app.workspace.display(),
         plan.file_count,
         kb,
-        char_count,
         token_estimate,
         content_sum,
         framing_tokens,
         skipped_line,
         file_list,
     ))
-}
-
-/// Map a file extension (or path) to a markdown code-fence language tag.
-fn ext_to_language(path: &str) -> &'static str {
-    let p = Path::new(path);
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    match ext.to_ascii_lowercase().as_str() {
-        "rs" => "rust",
-        "toml" => "toml",
-        "json" => "json",
-        "yaml" | "yml" => "yaml",
-        "md" => "markdown",
-        "txt" | "rst" | "cfg" | "ini" | "env" | "example" | "lock" => "text",
-        "sh" | "bash" | "zsh" => "bash",
-        "py" => "python",
-        "rb" => "ruby",
-        "pl" => "perl",
-        "js" => "javascript",
-        "jsx" => "javascript",
-        "ts" => "typescript",
-        "tsx" => "typescript",
-        "html" => "html",
-        "css" => "css",
-        "scss" | "sass" => "scss",
-        "less" => "less",
-        "c" => "c",
-        "cc" | "cpp" => "cpp",
-        "h" | "hpp" => "cpp",
-        "go" => "go",
-        "java" => "java",
-        "kt" => "kotlin",
-        "swift" => "swift",
-        "sql" => "sql",
-        "graphql" => "graphql",
-        "proto" => "protobuf",
-        "svg" => "xml",
-        "xml" => "xml",
-        _ => "", // plain text, no language tag
-    }
 }
 
 #[cfg(test)]
@@ -509,6 +529,35 @@ mod tests {
         App::new(options, &Config::default())
     }
 
+    /// Helper: extract all file paths mentioned in ToolUse blocks in api_messages.
+    fn injected_paths(app: &App) -> Vec<String> {
+        let mut paths = Vec::new();
+        for msg in &app.api_messages {
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { name, input, .. } = block
+                    && name == "read_file"
+                    && let Some(path) = input.get("path").and_then(|v| v.as_str())
+                {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+        paths
+    }
+
+    /// Helper: extract all file contents from ToolResult blocks in api_messages.
+    fn injected_contents(app: &App) -> Vec<String> {
+        let mut contents = Vec::new();
+        for msg in &app.api_messages {
+            for block in &msg.content {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    contents.push(content.clone());
+                }
+            }
+        }
+        contents
+    }
+
     #[test]
     fn inject_empty_workspace_returns_message() {
         let tmpdir = TempDir::new().unwrap();
@@ -517,7 +566,7 @@ mod tests {
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(
-            msg.contains("No project files found"),
+            msg.contains("No .agentsee file found"),
             "unexpected message: {msg}"
         );
     }
@@ -525,6 +574,8 @@ mod tests {
     #[test]
     fn inject_collects_source_and_doc_files() {
         let tmpdir = TempDir::new().unwrap();
+        // .agentsee is now required — patterns define what to include.
+        fs::write(tmpdir.path().join(".agentsee"), "*.rs\n*.md\n*.toml\n").unwrap();
         fs::write(tmpdir.path().join("main.rs"), "fn main() {}").unwrap();
         fs::write(tmpdir.path().join("README.md"), "# My Project").unwrap();
         fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
@@ -536,26 +587,30 @@ mod tests {
         let status = result.message.unwrap();
         assert!(status.contains("Injected 3 files"), "got: {status}");
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                assert!(content.contains("### `main.rs`"));
-                assert!(content.contains("fn main() {}"));
-                assert!(content.contains("### `README.md`"));
-                assert!(content.contains("# My Project"));
-                assert!(content.contains("### `Cargo.toml`"));
-                assert!(content.contains("[package]"));
-                assert!(content.contains("```rust"));
-                assert!(content.contains("```toml"));
-                assert!(content.contains("```markdown"));
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        assert!(paths.contains(&"main.rs".to_string()), "paths: {paths:?}");
+        assert!(paths.contains(&"README.md".to_string()), "paths: {paths:?}");
+        assert!(paths.contains(&"Cargo.toml".to_string()), "paths: {paths:?}");
+
+        let contents = injected_contents(&app);
+        let all_content = contents.join("\n");
+        assert!(all_content.contains("fn main() {}"));
+        assert!(all_content.contains("# My Project"));
+        assert!(all_content.contains("[package]"));
+
+        assert!(
+            matches!(&result.action, Some(AppAction::SendMessage(t)) if t.contains("Full Project Code Injection")),
+            "action: {:?}",
+            result.action
+        );
     }
 
     #[test]
     fn inject_respects_agentsee() {
         let tmpdir = TempDir::new().unwrap();
-        // *.rs first (higher priority), *.py second, !excluded/ excludes
+        // *.rs first (higher priority), *.py second, !excluded/ excludes.
+        // Gitignore last-match-wins: !excluded/ at pos 2 overrides earlier
+        // include patterns for paths under excluded/.
         fs::write(
             tmpdir.path().join(".agentsee"),
             "*.rs\n*.py\n!excluded/\n",
@@ -571,43 +626,72 @@ mod tests {
         fs::write(tmpdir.path().join("excluded/keep.py"), "print('nope')").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let _ = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                // Included by pattern
-                assert!(
-                    content.contains("visible.rs"),
-                    "visible.rs should be included; content: {content}"
-                );
-                assert!(
-                    content.contains("secret.py"),
-                    "secret.py should be included; content: {content}"
-                );
-                // Excluded by ! pattern
-                assert!(
-                    !content.contains("hidden.rs"),
-                    "hidden.rs in excluded/ should be force-excluded; content: {content}"
-                );
-                assert!(
-                    !content.contains("keep.py"),
-                    "keep.py in excluded/ should be force-excluded; content: {content}"
-                );
-                // Not in .agentsee at all
-                assert!(
-                    !content.contains("README.md"),
-                    "README.md should not be included (not in .agentsee); content: {content}"
-                );
-                // Priority order: *.rs files should appear before *.py files
-                let rs_pos = content.find("### `visible.rs`").unwrap();
-                let py_pos = content.find("### `secret.py`").unwrap();
-                assert!(
-                    rs_pos < py_pos,
-                    "*.rs (higher priority) must appear before *.py in output"
-                );
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        // Included by pattern
+        assert!(
+            paths.contains(&"visible.rs".to_string()),
+            "visible.rs should be included; paths: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"secret.py".to_string()),
+            "secret.py should be included; paths: {paths:?}"
+        );
+        // Excluded by ! pattern (last-match: !excluded/ at pos 2 wins)
+        assert!(
+            !paths.contains(&"excluded/hidden.rs".to_string()),
+            "excluded/hidden.rs should be force-excluded; paths: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"excluded/keep.py".to_string()),
+            "excluded/keep.py should be force-excluded; paths: {paths:?}"
+        );
+        // Not in .agentsee at all
+        assert!(
+            !paths.contains(&"README.md".to_string()),
+            "README.md should not be included (not in .agentsee); paths: {paths:?}"
+        );
+
+        // Priority order: *.rs files should appear before *.py files
+        let rs_idx = paths
+            .iter()
+            .position(|p| p == "visible.rs")
+            .expect("visible.rs should be present");
+        let py_idx = paths
+            .iter()
+            .position(|p| p == "secret.py")
+            .expect("secret.py should be present");
+        assert!(
+            rs_idx < py_idx,
+            "*.rs (higher priority) must appear before *.py in tool call list"
+        );
+    }
+
+    /// When `!exclude` comes *before* an include pattern in the file,
+    /// gitignore last-match-wins means the later include overrides the
+    /// earlier exclude — a file matching both will be included.
+    #[test]
+    fn inject_agentsee_last_match_wins_include_overrides_early_exclude() {
+        let tmpdir = TempDir::new().unwrap();
+        // !excluded/ at pos 0, *.py at pos 1.
+        // A .py file in excluded/ matches both; *.py (pos 1) wins → included.
+        fs::write(
+            tmpdir.path().join(".agentsee"),
+            "!excluded/\n*.py\n",
+        )
+        .unwrap();
+        fs::create_dir(tmpdir.path().join("excluded")).unwrap();
+        fs::write(tmpdir.path().join("excluded/keep.py"), "print('kept')").unwrap();
+
+        let mut app = create_test_app_in(&tmpdir);
+        let _ = inject_full_codes(&mut app, None);
+
+        let paths = injected_paths(&app);
+        assert!(
+            paths.contains(&"excluded/keep.py".to_string()),
+            "excluded/keep.py should be included: *.py (pos 1) overrides !excluded/ (pos 0); paths: {paths:?}"
+        );
     }
 
     #[test]
@@ -618,34 +702,25 @@ mod tests {
         // Small high-priority file
         fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
         // Large low-priority file that won't fit with Cargo.toml in budget.
-        // Cargo.toml is ~28 bytes; make big.rs large enough so combined > MAX.
         let big_content = "x".repeat(MAX_TOTAL_BYTES);
         fs::write(tmpdir.path().join("big.rs"), &big_content).unwrap();
         // Small low-priority file that fits after big.rs is skipped.
         fs::write(tmpdir.path().join("small.rs"), "fn main() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let _ = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                // Cargo.toml (high priority) should be included
-                assert!(content.contains("Cargo.toml"));
-                // big.rs is lower priority; would exceed budget, skipped
-                assert!(!content.contains("big.rs"));
-                // small.rs is also lower priority but fits after big.rs was
-                // skipped — however it sorts after big.rs alphabetically and
-                // budget may or may not allow it. The key invariant: high
-                // priority files come first.
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        // Cargo.toml (high priority) should be included
+        assert!(paths.contains(&"Cargo.toml".to_string()));
+        // big.rs is lower priority; would exceed budget, skipped
+        assert!(!paths.contains(&"big.rs".to_string()));
     }
 
     #[test]
     fn inject_agentsee_nested_dir_priority() {
-        // Patterns with `/` but no trailing slash should match everything
-        // recursively under that path.
+        // Patterns with trailing `/` match directory contents.
+        // `core/utils/` (pos 0) has higher priority than `core/` (pos 1).
         let tmpdir = TempDir::new().unwrap();
         fs::write(
             tmpdir.path().join(".agentsee"),
@@ -663,59 +738,62 @@ mod tests {
         fs::write(tmpdir.path().join("README.md"), "# readme").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let _ = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                // core/utils/ has higher priority → utils/helpers.py first
-                let utils_pos = content.find("helpers.py").unwrap();
-                let lib_pos = content.find("lib.rs").unwrap();
-                assert!(
-                    utils_pos < lib_pos,
-                    "core/utils/ (higher priority) must come before core/ files"
-                );
-                assert!(!content.contains("README.md"));
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        // core/utils/ has higher priority → helpers.py first
+        let utils_idx = paths
+            .iter()
+            .position(|p| p.contains("helpers.py"))
+            .expect("helpers.py should be present");
+        let lib_idx = paths
+            .iter()
+            .position(|p| p == "core/lib.rs")
+            .expect("core/lib.rs should be present");
+        assert!(
+            utils_idx < lib_idx,
+            "core/utils/ (higher priority) must come before core/ files"
+        );
+        assert!(!paths.contains(&"README.md".to_string()));
     }
 
     #[test]
     fn inject_agentsee_specificity_wins_over_bare_pattern() {
-        // A bare filename pattern (e.g. "README.md") should NOT capture files
-        // that also match a directory pattern (e.g. "docs/"). The directory
-        // pattern is more specific.
         let tmpdir = TempDir::new().unwrap();
+        // README.md (pos 0, basename-only) vs docs/ (pos 1, directory).
+        // docs/README.md matches both, but docs/ is more specific (has `/`),
+        // so it gets docs/'s priority (pos 1). Root README.md only matches
+        // the bare pattern (pos 0).
         fs::write(tmpdir.path().join(".agentsee"), "README.md\ndocs/\n").unwrap();
         fs::create_dir_all(tmpdir.path().join("docs")).unwrap();
         fs::write(tmpdir.path().join("docs/README.md"), "# sub readme").unwrap();
         fs::write(tmpdir.path().join("README.md"), "# root readme").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let _ = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                // Both files should be included
-                assert!(content.contains("### `README.md`"));
-                assert!(content.contains("### `docs/README.md`"));
-                // docs/README.md should be sorted into the docs/ pattern (index 1),
-                // not the bare README.md pattern (index 0). So root README.md
-                // (priority 0) comes before docs/ (priority 1).
-                let root_pos = content.find("### `README.md`").unwrap();
-                let docs_pos = content.find("### `docs/README.md`").unwrap();
-                assert!(
-                    root_pos < docs_pos,
-                    "root README.md (priority 0) should come before docs/README.md (priority 1)"
-                );
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        assert!(paths.contains(&"README.md".to_string()));
+        assert!(paths.contains(&"docs/README.md".to_string()));
+        // Root README.md (priority from pos 0) comes before docs/ (pos 1).
+        let root_pos = paths
+            .iter()
+            .position(|p| p == "README.md")
+            .expect("root README.md should be present");
+        let docs_pos = paths
+            .iter()
+            .position(|p| p == "docs/README.md")
+            .expect("docs/README.md should be present");
+        assert!(
+            root_pos < docs_pos,
+            "root README.md (pos 0) should come before docs/README.md (pos 1)"
+        );
     }
 
     #[test]
-    fn inject_no_agentsee_includes_all() {
-        // Without .agentsee, behavior is unchanged — all recognized files included.
+    fn inject_no_agentsee_reports_missing_file() {
+        // Without .agentsee, the command now returns an error telling the
+        // user to create one.
         let tmpdir = TempDir::new().unwrap();
         fs::write(tmpdir.path().join("a.rs"), "fn a() {}").unwrap();
         fs::write(tmpdir.path().join("b.py"), "print('b')").unwrap();
@@ -723,86 +801,140 @@ mod tests {
         let mut app = create_test_app_in(&tmpdir);
         let result = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                assert!(content.contains("a.rs"));
-                assert!(content.contains("b.py"));
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let msg = result.message.unwrap();
+        assert!(
+            msg.contains("No .agentsee file found"),
+            "expected missing-.agentsee error, got: {msg}"
+        );
     }
 
     #[test]
     fn inject_respects_gitignore() {
         let tmpdir = TempDir::new().unwrap();
-        // `.ignore` is honored by the ignore crate even outside a git repo.
+        // .agentsee required; `.ignore` excludes ignored/ dir.
+        fs::write(tmpdir.path().join(".agentsee"), "*.rs\n").unwrap();
         fs::write(tmpdir.path().join(".ignore"), "ignored/\n").unwrap();
         fs::create_dir(tmpdir.path().join("ignored")).unwrap();
         fs::write(tmpdir.path().join("ignored/secret.rs"), "fn secret() {}").unwrap();
         fs::write(tmpdir.path().join("visible.rs"), "fn visible() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let _ = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                assert!(content.contains("visible.rs"), "content: {content}");
-                assert!(
-                    !content.contains("secret.rs"),
-                    "ignored file leaked: {content}"
-                );
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        assert!(paths.contains(&"visible.rs".to_string()), "paths: {paths:?}");
+        assert!(
+            !paths.contains(&"secret.rs".to_string()),
+            "ignored file leaked: {paths:?}"
+        );
     }
 
     #[test]
     fn inject_skips_empty_files() {
         let tmpdir = TempDir::new().unwrap();
+        fs::write(tmpdir.path().join(".agentsee"), "*.rs\n").unwrap();
         fs::write(tmpdir.path().join("empty.rs"), "").unwrap();
         fs::write(tmpdir.path().join("real.rs"), "fn real() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let _ = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                assert!(content.contains("real.rs"));
-                assert!(!content.contains("empty.rs"));
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        assert!(paths.contains(&"real.rs".to_string()));
+        assert!(!paths.contains(&"empty.rs".to_string()));
     }
 
     #[test]
-    fn inject_skips_unsupported_extensions() {
+    fn inject_skips_files_not_in_agentsee() {
+        // Files with any extension are skipped unless .agentsee matches them.
+        // There is no built-in extension whitelist.
         let tmpdir = TempDir::new().unwrap();
+        fs::write(tmpdir.path().join(".agentsee"), "*.rs\n").unwrap();
         fs::write(tmpdir.path().join("image.png"), "fake-png-data").unwrap();
         fs::write(tmpdir.path().join("lib.rs"), "pub fn x() {}").unwrap();
 
         let mut app = create_test_app_in(&tmpdir);
-        let result = inject_full_codes(&mut app, None);
+        let _ = inject_full_codes(&mut app, None);
 
-        match result.action {
-            Some(AppAction::SendMessage(content)) => {
-                assert!(content.contains("lib.rs"));
-                assert!(!content.contains("image.png"));
-            }
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
+        let paths = injected_paths(&app);
+        assert!(paths.contains(&"lib.rs".to_string()));
+        assert!(!paths.contains(&"image.png".to_string()));
     }
 
     #[test]
-    fn ext_to_language_maps_correctly() {
-        assert_eq!(ext_to_language("main.rs"), "rust");
-        assert_eq!(ext_to_language("Cargo.toml"), "toml");
-        assert_eq!(ext_to_language("README.md"), "markdown");
-        assert_eq!(ext_to_language("script.py"), "python");
-        assert_eq!(ext_to_language("app.js"), "javascript");
-        assert_eq!(ext_to_language("types.ts"), "typescript");
-        assert_eq!(ext_to_language("style.css"), "css");
-        assert_eq!(ext_to_language("query.sql"), "sql");
-        assert_eq!(ext_to_language("doc.txt"), "text");
-        assert_eq!(ext_to_language("unknown.xyz"), "");
+    fn inject_with_user_text_adds_final_message() {
+        let tmpdir = TempDir::new().unwrap();
+        fs::write(tmpdir.path().join(".agentsee"), "*.rs\n").unwrap();
+        fs::write(tmpdir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let mut app = create_test_app_in(&tmpdir);
+        let result = inject_full_codes(&mut app, Some("总结项目内容".to_string()));
+
+        assert!(result.message.is_some());
+        let status = result.message.unwrap();
+        assert!(status.contains("Injected 1 file"), "got: {status}");
+
+        // The trigger for the next turn is the user's text
+        assert!(
+            matches!(&result.action, Some(AppAction::SendMessage(t)) if t == "总结项目内容"),
+            "action: {:?}",
+            result.action
+        );
+
+        let paths = injected_paths(&app);
+        assert!(paths.contains(&"main.rs".to_string()));
+    }
+
+    // --- gitignore_to_glob_patterns conversion tests ---
+
+    #[test]
+    fn glob_patterns_basename_match() {
+        // Patterns without `/` match the basename at any depth.
+        let pats = gitignore_to_glob_patterns("*.rs");
+        let patterns: Vec<Pattern> = pats.iter().filter_map(|g| Pattern::new(g).ok()).collect();
+        assert!(patterns.iter().any(|p| p.matches("main.rs")));
+        assert!(patterns.iter().any(|p| p.matches("src/main.rs")));
+        assert!(patterns.iter().any(|p| p.matches("deeply/nested/path/mod.rs")));
+    }
+
+    #[test]
+    fn glob_patterns_bare_name_matches_any_depth() {
+        let pats = gitignore_to_glob_patterns("README.md");
+        let patterns: Vec<Pattern> = pats.iter().filter_map(|g| Pattern::new(g).ok()).collect();
+        assert!(patterns.iter().any(|p| p.matches("README.md")));
+        assert!(patterns.iter().any(|p| p.matches("docs/README.md")));
+    }
+
+    #[test]
+    fn glob_patterns_anchored_by_slash() {
+        // Patterns with `/` are anchored to the workspace root.
+        // `docs/` → `docs/**` matches only files under docs/ at root.
+        let pats = gitignore_to_glob_patterns("docs/");
+        let patterns: Vec<Pattern> = pats.iter().filter_map(|g| Pattern::new(g).ok()).collect();
+        assert!(patterns.iter().any(|p| p.matches("docs/README.md")));
+        assert!(patterns.iter().any(|p| p.matches("docs/sub/file.md")));
+        assert!(!patterns.iter().any(|p| p.matches("other/docs/README.md")));
+        assert!(!patterns.iter().any(|p| p.matches("README.md")));
+    }
+
+    #[test]
+    fn glob_patterns_leading_slash_anchors_basename() {
+        // `/README.md` matches README.md at root only (not in subdirs).
+        let pats = gitignore_to_glob_patterns("/README.md");
+        let patterns: Vec<Pattern> = pats.iter().filter_map(|g| Pattern::new(g).ok()).collect();
+        assert!(patterns.iter().any(|p| p.matches("README.md")));
+        assert!(!patterns.iter().any(|p| p.matches("docs/README.md")));
+        assert!(!patterns.iter().any(|p| p.matches("src/README.md")));
+    }
+
+    #[test]
+    fn glob_patterns_middle_slash_anchored() {
+        // `foo/bar` matches `foo/bar` at root, not `x/foo/bar`.
+        let pats = gitignore_to_glob_patterns("foo/bar");
+        let patterns: Vec<Pattern> = pats.iter().filter_map(|g| Pattern::new(g).ok()).collect();
+        assert!(patterns.iter().any(|p| p.matches("foo/bar")));
+        assert!(patterns.iter().any(|p| p.matches("foo/bar/baz.txt")));
+        assert!(!patterns.iter().any(|p| p.matches("x/foo/bar")));
+        assert!(!patterns.iter().any(|p| p.matches("x/foo/bar/baz.txt")));
     }
 }

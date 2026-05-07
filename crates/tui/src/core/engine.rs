@@ -1880,7 +1880,12 @@ impl Engine {
         let stable_prompt =
             merge_system_prompts(Some(&base), self.session.compaction_summary_prompt.clone());
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
-        if self.session.last_system_prompt_hash != Some(stable_hash) {
+        // Update when the hash differs OR the current prompt is None
+        // (which can happen after Op::SyncSession with a None system_prompt
+        // — e.g. a /inject command firing before the first user message).
+        if self.session.system_prompt.is_none()
+            || self.session.last_system_prompt_hash != Some(stable_hash)
+        {
             self.session.system_prompt = stable_prompt;
             self.session.last_system_prompt_hash = Some(stable_hash);
         }
