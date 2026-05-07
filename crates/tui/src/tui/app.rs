@@ -742,6 +742,10 @@ pub struct App {
     pub max_input_history: usize,
     pub allow_shell: bool,
     pub max_subagents: usize,
+    /// Maximum tokens for `/inject-full-codes` content (soft cap).
+    /// Defaults to 200 000 tokens (~800 KB) from config; overridable via
+    /// `/inject --max-tokens N`.
+    pub max_inject_tokens: usize,
     /// Cached sub-agent snapshots for UI views.
     pub subagent_cache: Vec<SubAgentResult>,
     /// Last known per-agent progress text for running sub-agents.
@@ -1317,6 +1321,7 @@ impl App {
             max_input_history,
             allow_shell,
             max_subagents,
+            max_inject_tokens: config.max_inject_tokens.unwrap_or(200_000),
             subagent_cache: Vec::new(),
             agent_progress: HashMap::new(),
             subagent_card_index: HashMap::new(),

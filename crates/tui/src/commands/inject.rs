@@ -23,10 +23,14 @@ use crate::tui::history::HistoryCell;
 
 use super::CommandResult;
 
-/// Hard cap on the total bytes of file content collected.
-/// ~800 KB ≈ 200K tokens at ~4 bytes/token, leaving ~800K tokens for
-/// the system prompt, conversation history, and model response.
-const MAX_TOTAL_BYTES: usize = 800_000;
+/// Default token budget for injected file content (~800 KB ≈ 200K tokens).
+#[allow(dead_code)]
+pub const DEFAULT_MAX_INJECT_TOKENS: usize = 200_000;
+
+/// Convert a token budget to a byte budget using the ~4 chars/token heuristic.
+fn tokens_to_bytes(tokens: usize) -> usize {
+    tokens.saturating_mul(4)
+}
 
 /// A parsed include rule from a `.agentsee` line.
 ///
@@ -217,7 +221,7 @@ struct InjectPlan {
 /// Files are collected in priority order: files matching earlier patterns
 /// are read first.  When budget is tight, later (less important) files are
 /// naturally skipped.
-fn collect_project_files(workspace: &Path) -> Option<InjectPlan> {
+fn collect_project_files(workspace: &Path, max_bytes: usize) -> Option<InjectPlan> {
     if !workspace.is_dir() {
         return None;
     }
@@ -275,7 +279,7 @@ fn collect_project_files(workspace: &Path) -> Option<InjectPlan> {
             continue;
         }
 
-        if total_bytes + content.len() > MAX_TOTAL_BYTES {
+        if total_bytes + content.len() > max_bytes {
             skipped_count += 1;
             continue;
         }
@@ -295,6 +299,35 @@ fn collect_project_files(workspace: &Path) -> Option<InjectPlan> {
     })
 }
 
+/// Parse the `/inject` or `/fct` command argument for an optional
+/// `--max-tokens N` prefix.  Returns `(override_tokens, user_text)`.
+fn parse_inject_arg(arg: Option<&str>) -> (Option<usize>, Option<String>) {
+    let arg = match arg {
+        Some(a) => a,
+        None => return (None, None),
+    };
+    // Try to strip `--max-tokens` prefix (space-separated from the number).
+    let rest = match arg.strip_prefix("--max-tokens") {
+        Some(r) => r.trim_start(),
+        None => return (None, Some(arg.to_string())),
+    };
+    if rest.is_empty() {
+        return (None, None); // incomplete flag, fall back to config default
+    }
+    // Split off the token count; everything after the first whitespace is user text.
+    if let Some((num_str, trailing)) = rest.split_once(char::is_whitespace) {
+        let tokens = num_str.parse::<usize>().ok();
+        let user_text = if trailing.trim().is_empty() {
+            None
+        } else {
+            Some(trailing.trim().to_string())
+        };
+        (tokens, user_text)
+    } else {
+        (rest.parse::<usize>().ok(), None)
+    }
+}
+
 /// Walk the workspace and inject every project file into the context as
 /// synthetic `read_file` tool-call / tool-result pairs.
 ///
@@ -309,7 +342,12 @@ fn collect_project_files(workspace: &Path) -> Option<InjectPlan> {
 /// When `user_text` is present (e.g. from `/inject 总结项目内容`), it is
 /// appended as a final user message after all tool results so the model
 /// receives both the full project context and the user's request.
-pub fn inject_full_codes(app: &mut App, user_text: Option<String>) -> CommandResult {
+pub fn inject_full_codes(app: &mut App, raw_arg: Option<String>) -> CommandResult {
+    let (max_tokens_override, user_text) =
+        parse_inject_arg(raw_arg.as_deref());
+    let max_tokens = max_tokens_override.unwrap_or(app.max_inject_tokens);
+    let max_bytes = tokens_to_bytes(max_tokens);
+
     if !app.workspace.join(".agentsee").exists() {
         return CommandResult::message(
             "No .agentsee file found at workspace root.\n\n\
@@ -319,7 +357,7 @@ pub fn inject_full_codes(app: &mut App, user_text: Option<String>) -> CommandRes
              (e.g. \"!tests/\").",
         );
     }
-    let Some(plan) = collect_project_files(&app.workspace) else {
+    let Some(plan) = collect_project_files(&app.workspace, max_bytes) else {
         return CommandResult::message(
             "No files matched the .agentsee patterns. \
              Check that your patterns match files in the workspace.",
@@ -415,8 +453,8 @@ pub fn inject_full_codes(app: &mut App, user_text: Option<String>) -> CommandRes
 
     CommandResult::with_message_and_action(
         format!(
-            "Injected {} files (~{} KB) into context as read_file calls{}",
-            file_count, total_kb, skipped_note
+            "Injected {} files (~{} KB) into context as read_file calls (budget: ~{}K tokens){}",
+            file_count, total_kb, max_tokens / 1000, skipped_note
         ),
         AppAction::SendMessage(trigger_text),
     )
@@ -424,14 +462,19 @@ pub fn inject_full_codes(app: &mut App, user_text: Option<String>) -> CommandRes
 
 /// Dry-run the injection and estimate how many tokens the full set of
 /// messages would consume. Does NOT modify the conversation.
-pub fn full_codes_tokens(app: &App) -> CommandResult {
+pub fn full_codes_tokens(app: &App, raw_arg: Option<String>) -> CommandResult {
+    let (max_tokens_override, _user_text) =
+        parse_inject_arg(raw_arg.as_deref());
+    let max_tokens = max_tokens_override.unwrap_or(app.max_inject_tokens);
+    let max_bytes = tokens_to_bytes(max_tokens);
+
     if !app.workspace.join(".agentsee").exists() {
         return CommandResult::message(
             "No .agentsee file found at workspace root. \
              Create one first, then use /full-codes-tokens to estimate.",
         );
     }
-    let Some(plan) = collect_project_files(&app.workspace) else {
+    let Some(plan) = collect_project_files(&app.workspace, max_bytes) else {
         return CommandResult::message(
             "No files matched the .agentsee patterns.",
         );
@@ -477,6 +520,7 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
     CommandResult::message(format!(
         "Full Codes Token Estimate (as read_file tool calls)\n\
          Workspace: {}\n\
+         Budget: ~{} tokens\n\
          Files: {}\n\
          Content size: ~{} KB\n\
          Estimated tokens: ~{}  (~4 chars/token heuristic)\n\
@@ -486,6 +530,7 @@ pub fn full_codes_tokens(app: &App) -> CommandResult {
          Per-file breakdown (priority order):\n\
          {}",
         app.workspace.display(),
+        max_tokens,
         plan.file_count,
         kb,
         token_estimate,
@@ -702,7 +747,7 @@ mod tests {
         // Small high-priority file
         fs::write(tmpdir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
         // Large low-priority file that won't fit with Cargo.toml in budget.
-        let big_content = "x".repeat(MAX_TOTAL_BYTES);
+        let big_content = "x".repeat(tokens_to_bytes(DEFAULT_MAX_INJECT_TOKENS));
         fs::write(tmpdir.path().join("big.rs"), &big_content).unwrap();
         // Small low-priority file that fits after big.rs is skipped.
         fs::write(tmpdir.path().join("small.rs"), "fn main() {}").unwrap();

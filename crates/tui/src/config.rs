@@ -788,6 +788,11 @@ pub struct Config {
     pub managed_config_path: Option<String>,
     pub requirements_path: Option<String>,
     pub max_subagents: Option<usize>,
+    /// Maximum tokens for `/inject-full-codes` output (soft cap on total file
+    /// content bytes, converted at ~4 bytes/token).  Defaults to 200 000 tokens
+    /// (~800 KB) when unset.  The `/inject --max-tokens N` command argument
+    /// overrides this value for a single invocation.
+    pub max_inject_tokens: Option<usize>,
     pub retry: Option<RetryConfig>,
     pub capacity: Option<CapacityConfig>,
     pub features: Option<FeaturesToml>,
@@ -2368,6 +2373,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
             .or(base.managed_config_path),
         requirements_path: override_cfg.requirements_path.or(base.requirements_path),
         max_subagents: override_cfg.max_subagents.or(base.max_subagents),
+        max_inject_tokens: override_cfg.max_inject_tokens.or(base.max_inject_tokens),
         retry: override_cfg.retry.or(base.retry),
         capacity: override_cfg.capacity.or(base.capacity),
         tui: override_cfg.tui.or(base.tui),
